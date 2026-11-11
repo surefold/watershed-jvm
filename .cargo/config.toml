@@ -1,0 +1,4 @@
+# The engine's repository is private: fetch it with the git on this machine,
+# which knows how to sign in, and not with cargo's own.
+[net]
+git-fetch-with-cli = true

@@ -1,0 +1,24 @@
+[package]
+name = "watershed-jvm"
+version = "0.1.0"
+publish = false
+description = "The watershed engine as a C library for the JVM, called from Kotlin and Scala"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "watershed_jvm"
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[dependencies]
+# The engine, at a commit of its own repository. Move `rev` forward to take
+# a newer engine (and run `sbt test`).
+watershed-core = { git = "https://github.com/surefold/watershed", rev = "d008a9d2d07dafd565d864328fbcd917543bbe17" }
+
+# A C library has to read what it is pointed at, so unsafe code is allowed
+# here. All of it is in src/ffi.rs.
+[lints.clippy]
+all = { level = "warn", priority = -1 }
