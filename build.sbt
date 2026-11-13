@@ -86,6 +86,20 @@ lazy val scalaLayer = (project in file("scala"))
     libraryDependencies += "org.scalameta" %% "munit" % "1.3.6" % Test,
   )
 
+// EXPERIMENTAL. A run of many scenarios cut into lots and given to the workers of a Surefold Core cluster.
+lazy val cluster = (project in file("cluster"))
+  .enablePlugins(KotlinPlugin)
+  .dependsOn(kotlinLayer)
+  .settings(jdk, kotlinModule, native)
+  .settings(
+    name := "watershed-cluster",
+    libraryDependencies ++= Seq(
+      "dev.surefold" % "surefold-cluster" % "0.18.1",
+      "org.jetbrains.kotlin" % "kotlin-test-junit5" % kotlin % Test,
+      "com.github.sbt.junit" % "jupiter-interface" % "0.19.0" % Test,
+    ),
+  )
+
 lazy val exampleKotlin = (project in file("examples/kotlin"))
   .enablePlugins(KotlinPlugin)
   .dependsOn(kotlinLayer)
@@ -106,7 +120,7 @@ lazy val exampleScala = (project in file("examples/scala"))
   )
 
 lazy val root = (project in file("."))
-  .aggregate(core, kotlinLayer, scalaLayer, exampleKotlin, exampleScala)
+  .aggregate(core, kotlinLayer, scalaLayer, cluster, exampleKotlin, exampleScala)
   .settings(
     name := "watershed-jvm",
     publish / skip := true,
