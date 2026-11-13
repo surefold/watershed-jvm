@@ -13,6 +13,12 @@ net="watershed-$$"
 docker network create "$net" >/dev/null
 names=()
 trap 'docker rm -f "${names[@]}" >/dev/null 2>&1 || true; docker network rm "$net" >/dev/null 2>&1 || true' EXIT
+# A folder the engine's `rerun` example wrote has a patch as well: the workers then hold their lots, and are
+# brought up to date with it.
+more=()
+if [ -f "$folder/patch" ]; then
+  more=(columns=/data/columns hold=true patch=/data/patch check-after=/data/whole-after)
+fi
 rm -rf "$folder/out"
 user="$(id -u):$(id -g)"
 cores=$(nproc)
@@ -25,4 +31,4 @@ done
 names+=("$net-coordinator")
 docker run --name "$net-coordinator" --hostname coordinator --network "$net" --user "$user" -v "$folder:/data" "$image" \
   coordinator host=coordinator port=25520 plan=/data/plan inputs=/data/paths inputs-per="$inputs_per" \
-  outputs-per="$outputs_per" lot="$lot" out=/data/out workers="$workers" check=/data/whole 2>/dev/null
+  outputs-per="$outputs_per" lot="$lot" out=/data/out workers="$workers" check=/data/whole "${more[@]}" 2>/dev/null

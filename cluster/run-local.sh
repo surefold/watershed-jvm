@@ -25,10 +25,16 @@ logs="$(mktemp -d)"
 pids=()
 trap 'kill "${pids[@]}" 2>/dev/null || true' EXIT
 
+# A folder the engine's `rerun` example wrote has more: which outputs are the answers, and a patch to bring the
+# run up to date with after it. The workers then hold their lots.
+more=()
+if [ -f "$folder/patch" ]; then
+  more=(columns="$folder/columns" hold=true patch="$folder/patch" check-after="$folder/whole-after")
+fi
 rm -rf "$folder/out"
 "${run[@]}" coordinator port=$port plan="$folder/plan" inputs="$folder/paths" inputs-per=$inputs_per \
   outputs-per=$outputs_per lot="$lot" out="$folder/out" workers=$((gpus + cpus)) check="$folder/whole" \
-  2>"$logs/coordinator.log" &
+  "${more[@]}" 2>"$logs/coordinator.log" &
 coordinator=$!
 cores=$(nproc)
 # The GPU workers share the card: four fifths of what is free now, split between them.

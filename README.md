@@ -197,10 +197,45 @@ one GPU.** A small book (500 kinds of policy, 400 paths) gave the same
 answers from two GPU workers and a CPU worker together, and from CPU workers
 in three containers.
 
+### Bringing a run up to date after a change
+
+A job can ask each worker to hold on to the lots it runs: every kept value
+of every scenario, in the worker's memory. When an input of the graph
+changes, the engine's `Kept` gives a patch, a small plan of what the change
+reaches, and `coordinator.refresh` has every worker run it on the lots it
+holds and write their answers again. Nothing is run again but that.
+
+```kotlin
+val kept = g.kept(vary = paths, outputs = totals, keep = groupSums)
+kept.plan.save(planFile)
+val job = Job("book", planFile, scenarios, 240, 1_250, folder, columns = kept.outputColumns.toList(), hold = true)
+coordinator.run(job)
+
+g[promised] = 1.1 * was          // one policy changes
+g.stabilize()
+kept.patch(listOf(promised))!!.save(patchFile)
+val report = coordinator.refresh(job, patchFile)   // report.lost: lots whose worker has gone
+```
+
+On the same insurance book, holding 11,436 values a path (915 MB in all),
+after one policy's promised amount changes, one run of each:
+
+| | First run | Brought up to date | Answers after |
+|---|---|---|---|
+| The engine alone, in one process | 11.2 s | 0.14 to 0.22 s | the reference |
+| One GPU worker | 21.1 s | 0.41 s | the same to the last bit |
+| Two GPU workers sharing the card | 22.4 s | 0.37 s | the same |
+
+The patch is 1 MB and works out 9,327 nodes for each path, of 19.9 million.
+A lot whose worker has gone since the first run cannot be brought up to
+date: it is left as it was and listed in the report, and
+`coordinator.run(job, only = report.lost)`, with a plan made after the
+change, runs just those again. The tests do that. As with the engine's
+`Kept`, this helps only a change that reaches a small part of the model.
+
 Not done: a job is lost if the coordinator stops; the files must be on
 storage every node reaches, and nothing here copies them; one job runs at a
-time; a worker holds nothing between lots but the plan, so bringing a run up
-to date after a change (the engine's `Kept`) is not spread over workers yet.
+time; what a worker holds is in its memory only, and is gone if it stops.
 
 ## How it fits together
 
