@@ -2,7 +2,7 @@
 # EXPERIMENTAL. A coordinator and some workers on this machine, as separate processes, running the scenarios in
 # a folder that the engine's `split` example wrote (WATERSHED_KEEP=folder): plan, paths and whole.
 #
-#     cluster/run-local.sh FOLDER LOT GPU_WORKERS [CPU_WORKERS] [INPUTS_PER=240] [OUTPUTS_PER=4]
+#     [KILL_AFTER=seconds] cluster/run-local.sh FOLDER LOT GPU_WORKERS [CPU_WORKERS] [INPUTS_PER=240] [OUTPUTS_PER=4]
 #
 # Build first: WATERSHED_CUDA=1 sbt cluster/compile. Workers here share one GPU, so this shows that the answers
 # are right and what the cluster costs, not that it is faster.
@@ -31,8 +31,14 @@ rm -rf "$folder/out"
   2>"$logs/coordinator.log" &
 coordinator=$!
 cores=$(nproc)
+# The GPU workers share the card: four fifths of what is free now, split between them.
+if [ "$gpus" -gt 0 ]; then
+  free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -1)
+  bytes=$((free * 1048576 / 5 * 4 / gpus))
+fi
 for n in $(seq 1 "$gpus"); do
-  "${run[@]}" worker name="gpu-$n" port=$((port + n)) seed="127.0.0.1:$port" gpu=true >"$logs/gpu-$n.log" 2>&1 &
+  "${run[@]}" worker name="gpu-$n" port=$((port + n)) seed="127.0.0.1:$port" gpu=true gpu-bytes=$bytes \
+    >"$logs/gpu-$n.log" 2>&1 &
   pids+=($!)
 done
 for n in $(seq 1 "$cpus"); do
@@ -41,6 +47,10 @@ for n in $(seq 1 "$cpus"); do
     "${run[@]}" worker name="cpu-$n" port=$((port + 100 + n)) seed="127.0.0.1:$port" gpu=false >"$logs/cpu-$n.log" 2>&1 &
   pids+=($!)
 done
+# Set KILL_AFTER to a number of seconds to kill the first worker outright that long after starting, as a crash.
+if [ -n "${KILL_AFTER:-}" ]; then
+  (sleep "$KILL_AFTER"; kill -9 "${pids[0]}" 2>/dev/null && echo "killed the first worker after ${KILL_AFTER}s") &
+fi
 if wait "$coordinator"; then status=0; else status=$?; fi
 echo "logs in $logs"
 exit $status

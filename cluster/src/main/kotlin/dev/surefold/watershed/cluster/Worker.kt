@@ -14,12 +14,16 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * EXPERIMENTAL. Makes this node a worker: it runs one lot at a time, on its GPU if it has one and [gpu] is not
- * false, and otherwise on the CPU. Give the node the [WORKER] role when it joins the cluster.
+ * false, and otherwise on the CPU. Give the node the [WORKER] role when it joins the cluster. A worker that
+ * shares its GPU with others is told how many bytes of its memory it may use, with [gpuBytes].
+ *
+ * Join the cluster with `ready = Ready.WhenTold` and call `admit()` after this, so that the coordinator does not
+ * hear of the node before it can take a lot; a lot offered too early is only offered again a few seconds later.
  *
  * A plan is read once and kept, so only a worker's first lot of a job pays for loading it. [beforeRun] is called
  * with each lot's number just before it is run; tests use it to hold a worker up.
  */
-fun Scope<*>.worker(node: RemoteNode, gpu: Boolean? = null, beforeRun: (Int) -> Unit = {}) {
+fun Scope<*>.worker(node: RemoteNode, gpu: Boolean? = null, gpuBytes: Long? = null, beforeRun: (Int) -> Unit = {}) {
     val name = node.self.toString()
     val card: Gpu? = when (gpu) {
         false -> null
@@ -46,7 +50,11 @@ fun Scope<*>.worker(node: RemoteNode, gpu: Boolean? = null, beforeRun: (Int) -> 
             loaded = (System.nanoTime() - started) / 1e9
             beforeRun(lot.lot)
             val running = System.nanoTime()
-            val answers = if (card == null) plan.runCpu(inputs) else card.run(plan, inputs)
+            val answers = when {
+                card == null -> plan.runCpu(inputs)
+                gpuBytes == null -> card.run(plan, inputs)
+                else -> card.run(plan, inputs, gpuBytes)
+            }
             ran = (System.nanoTime() - running) / 1e9
             writeNumbers(Path.of(lot.answers), answers)
             null

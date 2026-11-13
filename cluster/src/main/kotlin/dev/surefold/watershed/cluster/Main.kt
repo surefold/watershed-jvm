@@ -3,6 +3,7 @@ package dev.surefold.watershed.cluster
 import dev.surefold.actor.remote.node
 import dev.surefold.cluster.Discovery
 import dev.surefold.cluster.Downing
+import dev.surefold.cluster.Ready
 import dev.surefold.cluster.cluster
 import dev.surefold.scope
 import java.nio.file.Files
@@ -14,13 +15,14 @@ import kotlin.time.Duration.Companion.seconds
 
 private const val USAGE = """EXPERIMENTAL. One node of a cluster that runs a plan's scenarios in lots.
 
-  worker       name=w1 port=25521 seed=HOST:PORT [host=127.0.0.1] [gpu=true|false]
+  worker       name=w1 port=25521 seed=HOST:PORT [host=127.0.0.1] [gpu=true|false] [gpu-bytes=N]
   coordinator  port=25520 plan=FILE inputs=FILE inputs-per=N outputs-per=N lot=N out=FOLDER
                [host=127.0.0.1] [workers=1] [wait=120] [lot-within=1800] [check=FILE] [job=job]
 
 Every node must be able to read the plan and the inputs, and write to the folder, under the same paths.
 The coordinator is the seed: start it first, and give its host and port to each worker. A worker runs lots on
-its GPU if it has one (pick which with CUDA_VISIBLE_DEVICES) unless gpu=false, and until it is stopped."""
+its GPU if it has one (pick which with CUDA_VISIBLE_DEVICES) unless gpu=false, and until it is stopped.
+Workers that share one GPU are each told how much of its memory to use, with gpu-bytes."""
 
 private fun settings(args: List<String>): Map<String, String> = args.associate {
     val at = it.indexOf('=')
@@ -42,8 +44,17 @@ fun main(args: Array<String>) {
     when (args[0]) {
         "worker" -> scope {
             val node = node(set.need("name"), set.need("port").toInt(), host = host)
-            cluster(node, Discovery.static(set.need("seed")), downing = downing, leaveWithin = 5.seconds, roles = setOf(WORKER))
-            worker(node, gpu = set["gpu"]?.toBooleanStrict())
+            // It joins, but is not counted a member that can be given lots until its worker is there to take them.
+            val cluster = cluster(
+                node,
+                Discovery.static(set.need("seed")),
+                downing = downing,
+                leaveWithin = 5.seconds,
+                roles = setOf(WORKER),
+                ready = Ready.WhenTold,
+            )
+            worker(node, gpu = set["gpu"]?.toBooleanStrict(), gpuBytes = set["gpu-bytes"]?.toLong())
+            cluster.admit()
             println("worker ${node.self} is up")
             CountDownLatch(1).await()
         }
@@ -73,6 +84,7 @@ fun main(args: Array<String>) {
                 for (lot in report.lots) {
                     println("%5d  %-34s %4s %9.1fs %9.1fs".format(lot.lot, lot.worker, lot.on, lot.loadSeconds, lot.runSeconds))
                 }
+                report.failures.forEach { println("failed and given to another: $it") }
                 println("all ${job.lots} lots answered in ${report.took}; ${report.givenAgain} given out again")
                 val outputs = set.need("outputs-per").toInt()
                 val check = set["check"] ?: return@scope true

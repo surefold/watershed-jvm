@@ -45,8 +45,11 @@ data class Job(val id: String, val plan: Path, val inputs: Path, val inputsPerSc
 /** One lot as it was run, for a report. */
 data class LotRun(val lot: Int, val worker: String, val on: String, val loadSeconds: Double, val runSeconds: Double)
 
-/** How a job went: who ran each lot, how many lots were given out again, and how long it all took. */
-data class Report(val lots: List<LotRun>, val givenAgain: Int, val took: Duration)
+/**
+ * How a job went: who ran each lot, how many lots were given out again, why any lot failed on a worker before
+ * another ran it, and how long it all took.
+ */
+data class Report(val lots: List<LotRun>, val givenAgain: Int, val failures: List<String>, val took: Duration)
 
 /** A job that could not be finished. */
 class JobFailed(why: String) : RuntimeException(why)
@@ -82,6 +85,7 @@ class Coordinator internal constructor(
     private val tries = HashMap<Int, Int>()
     private var givenAgain = 0
     private var failure: String? = null
+    private val failures = ArrayList<String>()
 
     /** How many workers the cluster has now. */
     fun workers(): Int = lock.withLock { workers.values.count { it.usable } }
@@ -132,6 +136,7 @@ class Coordinator internal constructor(
             waiting.remove(outcome.lot)
         } else if (outcome.lot !in done) {
             val tried = (tries[outcome.lot] ?: 0) + 1
+            failures += "lot ${outcome.lot} on ${outcome.worker}: ${outcome.failed}"
             tries[outcome.lot] = tried
             if (tried >= attempts) {
                 failure = "lot ${outcome.lot} failed $tried times, last on ${outcome.worker}: ${outcome.failed}"
@@ -208,6 +213,7 @@ class Coordinator internal constructor(
             done.clear()
             tries.clear()
             givenAgain = 0
+            failures.clear()
             failure = null
             try {
                 while (done.size < job.lots) {
@@ -219,7 +225,7 @@ class Coordinator internal constructor(
                     // Woken by every outcome and change of member; the wait is for lots that have been out too long.
                     changed.awaitNanos(500_000_000)
                 }
-                return Report(done.values.sortedBy { it.lot }, givenAgain, started.elapsedNow())
+                return Report(done.values.sortedBy { it.lot }, givenAgain, failures.toList(), started.elapsedNow())
             } finally {
                 this.job = null
                 workers.values.forEach {

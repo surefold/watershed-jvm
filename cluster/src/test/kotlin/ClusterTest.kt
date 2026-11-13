@@ -5,6 +5,7 @@ import dev.surefold.cluster.Cluster
 import dev.surefold.cluster.Discovery
 import dev.surefold.cluster.Downing
 import dev.surefold.cluster.Gossiping
+import dev.surefold.cluster.Ready
 import dev.surefold.cluster.cluster
 import dev.surefold.scope
 import dev.surefold.watershed.Expr
@@ -59,8 +60,11 @@ private class Nodes : AutoCloseable {
                         downing = Downing.keepMajority(stableAfter = 2.seconds),
                         leaveWithin = 3.seconds,
                         roles = roles,
+                        ready = Ready.WhenTold,
                     )
-                    made.complete(body(node, cluster))
+                    val result = body(node, cluster)
+                    cluster.admit()
+                    made.complete(result)
                     stop.await()
                 }
             } catch (thrown: Throwable) {
@@ -135,10 +139,10 @@ class ClusterTest {
             val held = CountDownLatch(1)
             val stuck = CountDownLatch(1)
             val (_, stop) = nodes.start("worker-stuck", setOf(WORKER)) { node, _ ->
-                worker(node, gpu = false) {
+                worker(node, gpu = false, beforeRun = {
                     held.countDown()
                     stuck.await()
-                }
+                })
             }
             assertTrue(coordinator.awaitWorkers(3, 30.seconds), "three workers joined")
 
@@ -160,7 +164,7 @@ class ClusterTest {
             val coordinator = nodes.coordinator(lotWithin = 2.seconds)
             nodes.start("worker-0", setOf(WORKER)) { node, _ -> worker(node, gpu = false) }
             val stuck = CountDownLatch(1)
-            nodes.start("worker-stuck", setOf(WORKER)) { node, _ -> worker(node, gpu = false) { stuck.await() } }
+            nodes.start("worker-stuck", setOf(WORKER)) { node, _ -> worker(node, gpu = false, beforeRun = { stuck.await() }) }
             assertTrue(coordinator.awaitWorkers(2, 30.seconds), "two workers joined")
 
             val report = coordinator.run(job, within = 2.minutes)
