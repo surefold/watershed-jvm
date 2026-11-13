@@ -120,12 +120,12 @@ impl Plan {
 
 /// An NVIDIA GPU, as the JVM holds it.
 pub(crate) struct Gpu {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     inner: Mutex<watershed_gpu::Gpu>,
 }
 
 impl Gpu {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(crate) fn new() -> Result<Gpu> {
         watershed_gpu::Gpu::new()
             .map(|gpu| Gpu {
@@ -134,19 +134,19 @@ impl Gpu {
             .or_else(refused)
     }
 
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     pub(crate) fn new() -> Result<Gpu> {
-        refused("this build of the library has no GPU support: build it with the cuda feature")
+        refused("this build of the library has no GPU support: build it with the cuda or cuda-12 feature")
     }
 
     /// The bytes of the GPU's memory that are free.
     pub(crate) fn free_memory(&self) -> Result<i64> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         {
             let gpu = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             gpu.free_memory().map(|n| n as i64).or_else(refused)
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         refused("no GPU support")
     }
 
@@ -159,7 +159,7 @@ impl Gpu {
         out: &mut [f64],
         allowed: i64,
     ) -> Result<()> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         {
             let plan = plan.lock();
             Plan::scenarios(&plan, inputs, out)?;
@@ -169,7 +169,7 @@ impl Gpu {
             out.copy_from_slice(&results);
             Ok(())
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         {
             let _ = (plan, inputs, out, allowed);
             refused("no GPU support")
