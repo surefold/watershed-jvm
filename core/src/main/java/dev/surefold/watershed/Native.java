@@ -109,6 +109,22 @@ public final class Native {
             JAVA_LONG, ADDRESS, JAVA_LONG, ADDRESS, JAVA_LONG, ADDRESS);
     private static final MethodHandle ROWS = function("ws_rows", JAVA_LONG, JAVA_LONG);
 
+    private static final MethodHandle PLAN_NEW = function("ws_plan_new", JAVA_LONG,
+            JAVA_LONG, ADDRESS, JAVA_LONG, ADDRESS, JAVA_LONG, ADDRESS, JAVA_LONG);
+    private static final MethodHandle PLAN_FREE = function("ws_plan_free", null, JAVA_LONG);
+    private static final MethodHandle PLAN_SAVE = function("ws_plan_save", JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG);
+    private static final MethodHandle PLAN_LOAD = function("ws_plan_load", JAVA_LONG, ADDRESS, JAVA_LONG);
+    private static final MethodHandle PLAN_SIZES = function("ws_plan_sizes", JAVA_INT, JAVA_LONG, ADDRESS);
+    private static final MethodHandle PLAN_SET_SHARED = function("ws_plan_set_shared", JAVA_INT,
+            JAVA_LONG, ADDRESS, JAVA_LONG);
+    private static final MethodHandle PLAN_RUN_CPU = function("ws_plan_run_cpu", JAVA_INT,
+            JAVA_LONG, ADDRESS, JAVA_LONG, ADDRESS, JAVA_LONG);
+    private static final MethodHandle GPU_NEW = function("ws_gpu_new", JAVA_LONG);
+    private static final MethodHandle GPU_FREE = function("ws_gpu_free", null, JAVA_LONG);
+    private static final MethodHandle GPU_FREE_MEMORY = function("ws_gpu_free_memory", JAVA_LONG, JAVA_LONG);
+    private static final MethodHandle GPU_RUN = function("ws_gpu_run", JAVA_INT,
+            JAVA_LONG, JAVA_LONG, ADDRESS, JAVA_LONG, ADDRESS, JAVA_LONG, JAVA_LONG);
+
     // Room for what a call writes back (up to four numbers), per thread, so
     // reading a value or running an update allocates nothing.
     private static final ThreadLocal<MemorySegment> OUT =
@@ -538,6 +554,130 @@ public final class Native {
     public static long rows(long collection) {
         try {
             return (long) ROWS.invokeExact(collection);
+        } catch (Throwable thrown) {
+            throw impossible(thrown);
+        }
+    }
+
+    // ----------------------------------------------------------------- plans
+
+    private static MemorySegment ints(Arena arena, int[] values) {
+        return values.length == 0 ? MemorySegment.NULL : arena.allocateFrom(JAVA_INT, values);
+    }
+
+    private static MemorySegment doubles(Arena arena, double[] values) {
+        return values.length == 0 ? MemorySegment.NULL : arena.allocateFrom(JAVA_DOUBLE, values);
+    }
+
+    private static long address(long address) {
+        if (address == 0) {
+            throw refused();
+        }
+        return address;
+    }
+
+    /**
+     * A plan of the graph as it stands, freed once nothing can reach {@code owner}: the inputs to vary in every
+     * scenario, those shared by all of a run, and the outputs to read.
+     */
+    public static long plan(Object owner, long graph, int[] vary, int[] shared, int[] outputs) {
+        try (Arena arena = Arena.ofConfined()) {
+            long address = address((long) PLAN_NEW.invokeExact(graph, ints(arena, vary), (long) vary.length,
+                    ints(arena, shared), (long) shared.length, ints(arena, outputs), (long) outputs.length));
+            freeWith(owner, PLAN_FREE, address);
+            return address;
+        } catch (Throwable thrown) {
+            throw impossible(thrown);
+        }
+    }
+
+    /** A plan read from a file written by {@link #planSave}, freed once nothing can reach {@code owner}. */
+    public static long planLoad(Object owner, String path) {
+        try (Arena arena = Arena.ofConfined()) {
+            byte[] at = utf8(path);
+            long address = address((long) PLAN_LOAD.invokeExact(bytes(arena, at), (long) at.length));
+            freeWith(owner, PLAN_FREE, address);
+            return address;
+        } catch (Throwable thrown) {
+            throw impossible(thrown);
+        }
+    }
+
+    /** Writes a plan to a file. */
+    public static void planSave(long plan, String path) {
+        try (Arena arena = Arena.ofConfined()) {
+            byte[] at = utf8(path);
+            done((int) PLAN_SAVE.invokeExact(plan, bytes(arena, at), (long) at.length));
+        } catch (Throwable thrown) {
+            throw impossible(thrown);
+        }
+    }
+
+    /** How many varied inputs, shared inputs and outputs a plan has, and how many nodes it works out for a scenario. */
+    public static long[] planSizes(long plan) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = arena.allocate(JAVA_LONG, 4);
+            done((int) PLAN_SIZES.invokeExact(plan, out));
+            return out.toArray(JAVA_LONG);
+        } catch (Throwable thrown) {
+            throw impossible(thrown);
+        }
+    }
+
+    /** Gives a plan's shared inputs new values, for every run from now on. */
+    public static void planSetShared(long plan, double[] values) {
+        try (Arena arena = Arena.ofConfined()) {
+            done((int) PLAN_SET_SHARED.invokeExact(plan, doubles(arena, values), (long) values.length));
+        } catch (Throwable thrown) {
+            throw impossible(thrown);
+        }
+    }
+
+    /**
+     * Runs scenarios on the CPU, on all cores. {@code inputs} holds one scenario after another, and the result
+     * one scenario's outputs after another: {@code results} values in all.
+     */
+    public static double[] planRunCpu(long plan, double[] inputs, long results) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = arena.allocate(JAVA_DOUBLE, Math.max(results, 1));
+            done((int) PLAN_RUN_CPU.invokeExact(plan, doubles(arena, inputs), (long) inputs.length, out, results));
+            return out.asSlice(0, results * Double.BYTES).toArray(JAVA_DOUBLE);
+        } catch (Throwable thrown) {
+            throw impossible(thrown);
+        }
+    }
+
+    /** An NVIDIA GPU to run plans on, freed once nothing can reach {@code owner}. Throws if there is none. */
+    public static long gpu(Object owner) {
+        try {
+            long address = address((long) GPU_NEW.invokeExact());
+            freeWith(owner, GPU_FREE, address);
+            return address;
+        } catch (Throwable thrown) {
+            throw impossible(thrown);
+        }
+    }
+
+    /** The bytes of a GPU's memory that are free. */
+    public static long gpuFreeMemory(long gpu) {
+        try {
+            long free = (long) GPU_FREE_MEMORY.invokeExact(gpu);
+            if (free < 0) {
+                throw refused();
+            }
+            return free;
+        } catch (Throwable thrown) {
+            throw impossible(thrown);
+        }
+    }
+
+    /** Runs scenarios on a GPU, as {@link #planRunCpu} does on the CPU, within {@code allowed} bytes of its memory. */
+    public static double[] gpuRun(long gpu, long plan, double[] inputs, long results, long allowed) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = arena.allocate(JAVA_DOUBLE, Math.max(results, 1));
+            done((int) GPU_RUN.invokeExact(gpu, plan, doubles(arena, inputs), (long) inputs.length, out, results,
+                    allowed));
+            return out.asSlice(0, results * Double.BYTES).toArray(JAVA_DOUBLE);
         } catch (Throwable thrown) {
             throw impossible(thrown);
         }

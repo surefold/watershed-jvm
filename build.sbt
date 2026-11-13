@@ -23,7 +23,9 @@ val buildNative = taskKey[Unit]("Builds the engine as the C library the JVM call
 ThisBuild / buildNative := {
   val root = (ThisBuild / baseDirectory).value
   val log = streams.value.log
-  if (Process(Seq("cargo", "build", "--release", "--locked"), root).!(log) != 0)
+  // Set WATERSHED_CUDA to build it able to run plans on an NVIDIA GPU.
+  val cuda = if (sys.env.contains("WATERSHED_CUDA")) Seq("--features", "watershed-jvm/cuda") else Seq()
+  if (Process(Seq("cargo", "build", "--release", "--locked") ++ cuda, root).!(log) != 0)
     sys.error("building the native library failed")
 }
 

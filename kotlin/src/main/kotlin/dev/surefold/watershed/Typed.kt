@@ -153,6 +153,22 @@ class Graph {
     /** Applies every recorded change and recalculates what depends on them, and nothing else. */
     fun stabilize(): Report = Native.stabilize(address)
 
+    /**
+     * EXPERIMENTAL. A plan of the graph as it stands, to run for many scenarios at once: each scenario gives a
+     * value to every input in [vary], the [shared] inputs are the same in all of a run, and [outputs] are read.
+     * Call [stabilize] first. Later changes to the graph do not reach the plan.
+     */
+    fun plan(vary: List<Input<Double>>, outputs: List<Node<Double>>, shared: List<Input<Double>> = emptyList()): Plan =
+        Plan { owner ->
+            Native.plan(
+                owner,
+                address,
+                IntArray(vary.size) { mine(vary[it]).id },
+                IntArray(shared.size) { mine(shared[it]).id },
+                IntArray(outputs.size) { mine(outputs[it]).id },
+            )
+        }
+
     /** Why the node has its value, as a tree of what it was worked out from. */
     fun explain(node: Node<*>): String = Native.explain(address, mine(node).id)
 

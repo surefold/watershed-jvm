@@ -30,6 +30,7 @@ use std::sync::{Mutex, MutexGuard};
 use watershed_core::{AggregateOp, Collection as CoreCollection, Ir, NodeId, Type, Value};
 
 mod ffi;
+mod plan;
 mod wire;
 
 use wire::{Reader, Result};
@@ -124,6 +125,17 @@ impl Graph {
         let mut g = self.lock();
         let id = g.graph.input_value(name, value).or_else(refused)?;
         Ok(g.number(id))
+    }
+
+    /// The nodes the JVM means by these numbers.
+    fn nodes(&self, numbers: &[i32]) -> Result<Vec<NodeId>> {
+        let g = self.lock();
+        numbers.iter().map(|&n| g.node(n)).collect()
+    }
+
+    /// Runs `with` on the engine's graph as it stands.
+    fn read<T>(&self, with: impl FnOnce(&watershed_core::Graph) -> T) -> T {
+        with(&self.lock().graph)
     }
 
     fn define(&self, name: &str, expression: &[u8]) -> Result<i32> {
