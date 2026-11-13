@@ -115,6 +115,93 @@ An update with nothing to do is 42 ns. (The clock on that machine ticks
 every 41 ns, so the smallest figures are "one tick".) Adding a node is
 about 0.8 µs, and a row of two fields and a column about 1.2 µs.
 
+## Many scenarios at once (experimental)
+
+Kotlin only so far. A graph's plan runs it for many sets of inputs at once,
+on all CPU cores or an NVIDIA GPU, and gives what the graph gives for each,
+to the last bit. It is the engine's
+[scenario plans](https://github.com/surefold/watershed/blob/main/crates/watershed-gpu/README.md),
+with the same limits on what a plan can hold.
+
+```kotlin
+val g = Graph()
+val rate = g.input("rate", 0.01)
+val fee = g.input("fee", 0.002)
+val worth = g.define("worth", (rate - fee + 1.0) * 100.0)
+g.stabilize()
+
+val plan = g.plan(vary = listOf(rate), outputs = listOf(worth), shared = listOf(fee))
+val answers: DoubleArray = plan.runCpu(doubleArrayOf(0.01, 0.02, 0.03))   // one answer a scenario
+val onGpu = Gpu().run(plan, doubleArrayOf(0.01, 0.02, 0.03))               // needs a build with a GPU
+
+plan.save(Path.of("worth.plan"))             // for another process, or another machine
+val back = Plan.load(Path.of("worth.plan"))  // gives the same answers
+```
+
+The native library is built without a GPU unless asked: `WATERSHED_CUDA=1 sbt
+test` builds it against CUDA 13.1 (NVIDIA driver 580 or later), and
+`WATERSHED_CUDA=12` against CUDA 12.8 (driver 570 or later). Built for a GPU,
+the tests run a plan on it and check it against the CPU.
+
+## A cluster (experimental)
+
+`cluster/` cuts a run of many scenarios into lots and gives them to the
+workers of a [Surefold Core](https://github.com/surefold/surefold-core)
+cluster. A coordinator keeps the lots not yet answered and gives one to each
+idle worker; a worker runs a lot on its GPU, or its CPU, and writes the
+answers to a file. A lot whose worker leaves, cannot be reached, fails or
+takes too long is given to another. Scenarios do not depend on one another,
+so the answers put together are the same, to the last bit, as one run of them
+all.
+
+Plans are big (2 GB for a graph of 20 million nodes), so they do not cross
+between nodes: only "run scenarios 2,500 to 3,749 of this plan" does. Every
+node must be able to read the plan and the scenarios and write the answers
+under the same paths, which on one machine is a folder and across machines
+is a shared volume.
+
+```kotlin
+// On each worker:
+val node = node("worker-1", 25520, host = "10.0.0.8")
+val cluster = cluster(node, Discovery.static("10.0.0.7:25520"), roles = setOf(WORKER), ready = Ready.WhenTold)
+worker(node)
+cluster.admit()
+
+// On the coordinator:
+val coordinator = coordinator(node, cluster)
+val report = coordinator.run(Job("book", plan, scenarios, inputsPerScenario = 240, lot = 1_250, out = folder))
+```
+
+`cluster/run-local.sh` starts a coordinator and workers as separate processes
+on one machine, and `cluster/image.sh` builds one container image for every
+node, which `cluster/run-containers.sh` runs as containers on a Docker
+network.
+
+What has been tried, all on one machine with one RTX 3090, on the engine's
+insurance book (20,000 kinds of policy, 19.9 million nodes, 10,000 market
+paths, in lots of 1,250), one run of each:
+
+| | Time | Answers |
+|---|---|---|
+| One run in one process, no cluster | 11.6 s | the reference |
+| One GPU worker | 17.7 s, 6 s of it reading the plan | the same to the last bit |
+| Two GPU workers sharing the card | 23.5 s | the same |
+| Four GPU workers sharing the card | 22.4 s and 32.4 s (two runs) | the same |
+| Three GPU workers, one killed part way (lots of 625) | 21.8 s, one lot given out again | the same |
+| One GPU worker, built against CUDA 12.8 | 20.0 s | the same |
+
+Workers that share one card take turns on it, so more of them is no faster
+here: this shows that the answers are right and what the cluster costs, not
+a speed-up. **It has not been run on more than one machine, or on more than
+one GPU.** A small book (500 kinds of policy, 400 paths) gave the same
+answers from two GPU workers and a CPU worker together, and from CPU workers
+in three containers.
+
+Not done: a job is lost if the coordinator stops; the files must be on
+storage every node reaches, and nothing here copies them; one job runs at a
+time; a worker holds nothing between lots but the plan, so bringing a run up
+to date after a change (the engine's `Kept`) is not spread over workers yet.
+
 ## How it fits together
 
 ```
@@ -123,6 +210,7 @@ core/      one Java class, Native, that calls them, and Wire, which writes
            the bytes that cross
 kotlin/    the typed layer for Kotlin, and its tests
 scala/     the typed layer for Scala 3, and its tests
+cluster/   a run's lots given to the workers of a Surefold Core cluster
 examples/  a small program in each, and the benchmark
 ```
 
@@ -146,7 +234,8 @@ examples/  a small program in each, and the benchmark
 - Jars with the native library inside for each platform. Today a program
   outside this build needs the built library and
   `-Dwatershed.library.path`.
-- Only tried on macOS (arm64).
+- Tried on macOS (arm64) and Linux (x86-64, under WSL2).
+- Plans and the cluster from Scala.
 - In Kotlin, `Collection` shares a name with Kotlin's own, which wins when
   the type is written out: say `dev.surefold.watershed.Collection`, or let
   it be inferred.
