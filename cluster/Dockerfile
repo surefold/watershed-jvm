@@ -33,7 +33,8 @@ FROM nvidia/cuda:${CUDA}-base-ubuntu${UBUNTU}
 ARG NVRTC
 RUN apt-get update \
  && apt-get install -y --no-install-recommends "$NVRTC" \
- && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/* \
+ && ls -d /usr/local/cuda-*/lib64 > /etc/ld.so.conf.d/watershed-nvrtc.conf && ldconfig
 COPY --from=jre /opt/java/openjdk /opt/java
 COPY --from=native /src/target/release/libwatershed_jvm.so /opt/watershed/libwatershed_jvm.so
 COPY cluster/target/image/lib /opt/watershed/lib
