@@ -26,7 +26,21 @@ import kotlin.time.TimeSource
  * scenarios to a lot, and a folder, [out], that each lot's answers are written to. Every node must be able to
  * read [plan] and [inputs] and write to [out] under these same paths.
  */
-data class Job(val id: String, val plan: Path, val inputs: Path, val inputsPerScenario: Int, val lot: Int, val out: Path) {
+data class Job(
+    val id: String,
+    val plan: Path,
+    val inputs: Path,
+    val inputsPerScenario: Int,
+    val lot: Int,
+    val out: Path,
+    /** Which of the plan's outputs are written as a scenario's answers, in order; all of them if empty. */
+    val columns: List<Int> = emptyList(),
+    /**
+     * Whether each worker holds on to the lots it runs, every output of every scenario, so that
+     * [Coordinator.refresh] can bring them up to date. The plan is then a `Kept`'s, and [columns] its outputs.
+     */
+    val hold: Boolean = false,
+) {
     val scenarios: Long = countNumbers(inputs) / inputsPerScenario
     val lots: Int = Math.toIntExact((scenarios + lot - 1) / lot)
 
@@ -46,10 +60,21 @@ data class Job(val id: String, val plan: Path, val inputs: Path, val inputsPerSc
 data class LotRun(val lot: Int, val worker: String, val on: String, val loadSeconds: Double, val runSeconds: Double)
 
 /**
- * How a job went: who ran each lot, how many lots were given out again, why any lot failed on a worker before
- * another ran it, and how long it all took.
+ * How a job or a refresh went: who ran each lot, how many lots were given out again, why any lot failed on a
+ * worker, and how long it all took.
  */
-data class Report(val lots: List<LotRun>, val givenAgain: Int, val failures: List<String>, val took: Duration)
+data class Report(
+    val lots: List<LotRun>,
+    val givenAgain: Int,
+    val failures: List<String>,
+    val took: Duration,
+    /**
+     * After [Coordinator.refresh]: the lots that could not be brought up to date, because the worker that held
+     * them has gone or no longer holds them. Their answers are as they were; run them again with
+     * [Coordinator.run] and a plan made after the change.
+     */
+    val lost: List<Int> = emptyList(),
+)
 
 /** A job that could not be finished. */
 class JobFailed(why: String) : RuntimeException(why)
@@ -72,7 +97,7 @@ class Coordinator internal constructor(
     private val lotWithin: Duration,
     private val attempts: Int,
 ) {
-    private class Worker(val ref: ActorRef<Assign>, var lot: Int? = null, var since: TimeSource.Monotonic.ValueTimeMark? = null, var usable: Boolean = true, var restAfter: TimeSource.Monotonic.ValueTimeMark? = null)
+    private class Worker(val ref: ActorRef<ToWorker>, var lot: Int? = null, var since: TimeSource.Monotonic.ValueTimeMark? = null, var usable: Boolean = true, var restAfter: TimeSource.Monotonic.ValueTimeMark? = null)
 
     private val lock = ReentrantLock()
     private val changed = lock.newCondition()
@@ -85,6 +110,13 @@ class Coordinator internal constructor(
     private val tries = HashMap<Int, Int>()
     private var givenAgain = 0
     private var failure: String? = null
+
+    // What outcomes must carry to be counted: the job's id while it runs, and another for each refresh.
+    private var tag: String? = null
+    private var refreshes = 0
+
+    // For each job run to be held: the node that holds each lot.
+    private val holders = HashMap<String, HashMap<Int, Node>>()
     private val failures = ArrayList<String>()
 
     /** How many workers the cluster has now. */
@@ -105,7 +137,7 @@ class Coordinator internal constructor(
                 val known = workers[member.node]
                 if (known == null || event is MemberEvent.Up) {
                     known?.lot?.let(::again)
-                    workers[member.node] = Worker(node.remote(Address(member.node.toString(), WORKER_PATH, 0), AssignCodec))
+                    workers[member.node] = Worker(node.remote(Address(member.node.toString(), WORKER_PATH, 0), ToWorkerCodec))
                 } else {
                     known.usable = true
                 }
@@ -123,8 +155,7 @@ class Coordinator internal constructor(
     }
 
     internal fun heard(outcome: Outcome) = lock.withLock {
-        val job = job ?: return@withLock
-        if (outcome.job != job.id) return@withLock
+        if (job == null || outcome.job != tag) return@withLock
         workers.values.firstOrNull { it.lot == outcome.lot && it.ref.address.node == outcome.worker }?.let {
             it.lot = null
             it.since = null
@@ -138,7 +169,9 @@ class Coordinator internal constructor(
             val tried = (tries[outcome.lot] ?: 0) + 1
             failures += "lot ${outcome.lot} on ${outcome.worker}: ${outcome.failed}"
             tries[outcome.lot] = tried
-            if (tried >= attempts) {
+            if (tag != job?.id) {
+                // A refresh: the lot is left as it was, and reported lost.
+            } else if (tried >= attempts) {
                 failure = "lot ${outcome.lot} failed $tried times, last on ${outcome.worker}: ${outcome.failed}"
             } else {
                 again(outcome.lot)
@@ -180,13 +213,13 @@ class Coordinator internal constructor(
 
     // Off the lock: asks a worker to take a lot, and puts the lot back if it does not say yes.
     private fun offer(job: Job, worker: Worker, lot: Int) {
-        val taken = worker.ref.ask<Assign, Boolean>(5.seconds) { accepted ->
+        val taken = worker.ref.ask<ToWorker, Int>(5.seconds) { accepted ->
             Assign(
                 job.id, lot, job.plan.toString(), job.inputs.toString(), job.first(lot), job.count(lot),
-                job.answers(lot).toString(), accepted, outcomes,
+                job.answers(lot).toString(), job.columns, job.hold, accepted, outcomes,
             )
         }
-        if (taken is Either.Right && taken.value) return
+        if (taken is Either.Right && taken.value == TAKEN) return
         lock.withLock {
             if (worker.lot == lot) {
                 worker.lot = null
@@ -200,34 +233,127 @@ class Coordinator internal constructor(
 
     /**
      * Runs [job] on the cluster's workers and returns once every lot's answers are written, or throws [JobFailed]
-     * if a lot keeps failing or it is not done [within] that long.
+     * if a lot keeps failing or it is not done [within] that long. With [only], just those lots are run: the ones a
+     * refresh lost, with a plan made after the change.
      */
-    fun run(job: Job, within: Duration = 60.minutes): Report {
+    fun run(job: Job, within: Duration = 60.minutes, only: Collection<Int>? = null): Report {
         Files.createDirectories(job.out)
         val started = TimeSource.Monotonic.markNow()
         lock.withLock {
             check(this.job == null) { "one job at a time: ${this.job?.id} is still running" }
             this.job = job
+            tag = job.id
+            val lots = only?.distinct() ?: (0 until job.lots).toList()
+            require(lots.all { it in 0 until job.lots }) { "the job has lots 0 to ${job.lots - 1}, not all of $lots" }
             waiting.clear()
-            waiting.addAll(0 until job.lots)
+            waiting.addAll(lots)
             done.clear()
             tries.clear()
             givenAgain = 0
             failures.clear()
             failure = null
             try {
-                while (done.size < job.lots) {
+                while (done.size < lots.size) {
                     failure?.let { throw JobFailed(it) }
                     if (started.elapsedNow() > within) {
-                        throw JobFailed("${done.size} of ${job.lots} lots were done after $within")
+                        throw JobFailed("${done.size} of ${lots.size} lots were done after $within")
                     }
                     giveOut(job)
                     // Woken by every outcome and change of member; the wait is for lots that have been out too long.
                     changed.awaitNanos(500_000_000)
                 }
+                if (job.hold) {
+                    val holding = holders.getOrPut(job.id) { HashMap() }
+                    val nodes = workers.keys.associateBy { it.toString() }
+                    done.values.forEach { run -> nodes[run.worker]?.let { holding[run.lot] = it } ?: holding.remove(run.lot) }
+                }
                 return Report(done.values.sortedBy { it.lot }, givenAgain, failures.toList(), started.elapsedNow())
             } finally {
                 this.job = null
+                tag = null
+                workers.values.forEach {
+                    it.lot = null
+                    it.since = null
+                }
+            }
+        }
+    }
+
+    /**
+     * Brings [job], which was run to be held, up to date with the patch in the file at [patch]: each worker runs
+     * the patch on the lots it holds and writes their answers again. A lot whose worker has gone, or no longer
+     * holds it, is left as it was and listed in the report's `lost`.
+     */
+    fun refresh(job: Job, patch: Path, within: Duration = 60.minutes): Report {
+        val started = TimeSource.Monotonic.markNow()
+        lock.withLock {
+            check(this.job == null) { "one job at a time: ${this.job?.id} is still running" }
+            val holding = holders[job.id] ?: throw JobFailed("no run of ${job.id} is held")
+            val id = "${job.id}#refresh-${++refreshes}"
+            this.job = job
+            tag = id
+            waiting.clear()
+            done.clear()
+            tries.clear()
+            givenAgain = 0
+            failures.clear()
+            failure = null
+            val lost = sortedSetOf<Int>()
+            val queues = HashMap<Node, ArrayDeque<Int>>()
+            for (lot in 0 until job.lots) {
+                val node = holding[lot]
+                if (node == null) lost += lot else queues.getOrPut(node) { ArrayDeque() }.addLast(lot)
+            }
+            try {
+                while (done.size + lost.size < job.lots) {
+                    if (started.elapsedNow() > within) {
+                        throw JobFailed("${done.size} of ${job.lots} lots were brought up to date after $within")
+                    }
+                    // A lot that failed is not tried again: its values are as they were, and it is lost.
+                    for (lot in tries.keys) if (lot !in done) lost += lot
+                    for ((node, queue) in queues) {
+                        val worker = workers[node]
+                        if (worker == null || !worker.usable) {
+                            // Its holder has gone: what it held is lost, and so is any lot it was working on.
+                            lost += queue
+                            queue.clear()
+                            holding.entries.filter { it.value == node && it.key !in done }.forEach { lost += it.key }
+                            continue
+                        }
+                        if (worker.lot != null || queue.isEmpty() || worker.restAfter?.hasPassedNow() == false) continue
+                        val lot = queue.removeFirst()
+                        worker.lot = lot
+                        worker.since = TimeSource.Monotonic.markNow()
+                        Thread.startVirtualThread {
+                            val taken = worker.ref.ask<ToWorker, Int>(5.seconds) { accepted ->
+                                Refresh(job.id, id, lot, patch.toString(), job.answers(lot).toString(), job.columns, accepted, outcomes)
+                            }
+                            lock.withLock {
+                                if (tag == id && !(taken is Either.Right && taken.value == TAKEN)) {
+                                    worker.lot = null
+                                    worker.since = null
+                                    if (taken is Either.Right && taken.value == NOT_HELD) {
+                                        lost += lot
+                                    } else {
+                                        // Busy, or no answer: ask again shortly.
+                                        worker.restAfter = TimeSource.Monotonic.markNow() + 1.seconds
+                                        queue.addFirst(lot)
+                                    }
+                                    changed.signalAll()
+                                }
+                            }
+                        }
+                    }
+                    changed.awaitNanos(200_000_000)
+                }
+                lost.forEach(holding::remove)
+                return Report(
+                    done.values.sortedBy { it.lot }, 0, failures.toList(), started.elapsedNow(), lost.filter { it !in done },
+                )
+            } finally {
+                this.job = null
+                tag = null
+                waiting.clear()
                 workers.values.forEach {
                     it.lot = null
                     it.since = null

@@ -29,9 +29,37 @@ data class Assign(
     val first: Long,
     val count: Int,
     val answers: String,
-    val accepted: Reply<Boolean>,
+    /** Which of the plan's outputs to write to [answers], in order; all of them if empty. */
+    val columns: List<Int>,
+    /** Whether the worker is to hold on to the lot's inputs and every output, to be brought up to date later. */
+    val hold: Boolean,
+    val accepted: Reply<Int>,
     val done: ActorRef<Outcome>,
-)
+) : ToWorker
+
+/**
+ * A lot the worker holds, to be brought up to date with the patch in the file at [patch], and its [columns]
+ * written to [answers] again. It answers [accepted] as for a lot to run, or [NOT_HELD].
+ */
+data class Refresh(
+    val job: String,
+    /** What its outcome is to carry in place of the job's id, to tell one refresh's outcomes from another's. */
+    val tag: String,
+    val lot: Int,
+    val patch: String,
+    val answers: String,
+    val columns: List<Int>,
+    val accepted: Reply<Int>,
+    val done: ActorRef<Outcome>,
+) : ToWorker
+
+/** What a worker is told. */
+sealed interface ToWorker
+
+/** A worker's answers to being given something to do: it is busy, it has taken it, or it does not hold the lot. */
+const val BUSY = 0
+const val TAKEN = 1
+const val NOT_HELD = 2
 
 /** What became of a lot: [failed] is why it could not be run, or null when its answers are written. */
 data class Outcome(
@@ -66,28 +94,49 @@ object OutcomeCodec : MessageCodec<Outcome> {
     )
 }
 
-object AssignCodec : MessageCodec<Assign> {
-    override fun write(message: Assign, out: WireOut) {
-        out.string(message.job)
-        out.int(message.lot)
-        out.string(message.plan)
-        out.string(message.inputs)
-        out.long(message.first)
-        out.int(message.count)
-        out.string(message.answers)
-        out.reply(message.accepted, Codecs.boolean)
-        out.ref(message.done, OutcomeCodec)
+object ToWorkerCodec : MessageCodec<ToWorker> {
+    private val columns = Codecs.list(Codecs.int)
+
+    override fun write(message: ToWorker, out: WireOut) = when (message) {
+        is Assign -> {
+            out.int(1)
+            out.string(message.job)
+            out.int(message.lot)
+            out.string(message.plan)
+            out.string(message.inputs)
+            out.long(message.first)
+            out.int(message.count)
+            out.string(message.answers)
+            columns.write(message.columns, out)
+            out.boolean(message.hold)
+            out.reply(message.accepted, Codecs.int)
+            out.ref(message.done, OutcomeCodec)
+        }
+
+        is Refresh -> {
+            out.int(2)
+            out.string(message.job)
+            out.string(message.tag)
+            out.int(message.lot)
+            out.string(message.patch)
+            out.string(message.answers)
+            columns.write(message.columns, out)
+            out.reply(message.accepted, Codecs.int)
+            out.ref(message.done, OutcomeCodec)
+        }
     }
 
-    override fun read(input: WireIn): Assign = Assign(
-        input.string(),
-        input.int(),
-        input.string(),
-        input.string(),
-        input.long(),
-        input.int(),
-        input.string(),
-        input.reply(Codecs.boolean),
-        input.ref(OutcomeCodec),
-    )
+    override fun read(input: WireIn): ToWorker = when (val tag = input.int()) {
+        1 -> Assign(
+            input.string(), input.int(), input.string(), input.string(), input.long(), input.int(), input.string(),
+            columns.read(input), input.boolean(), input.reply(Codecs.int), input.ref(OutcomeCodec),
+        )
+
+        2 -> Refresh(
+            input.string(), input.string(), input.int(), input.string(), input.string(), columns.read(input),
+            input.reply(Codecs.int), input.ref(OutcomeCodec),
+        )
+
+        else -> error("no message to a worker has the tag $tag")
+    }
 }

@@ -39,7 +39,7 @@ import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 
 /** Several nodes of one cluster in this JVM, each in a scope of its own on a thread of its own. */
-private class Nodes : AutoCloseable {
+internal class Nodes : AutoCloseable {
     private val seed = free()
     private val stops = ArrayList<Pair<CountDownLatch, Thread>>()
 
