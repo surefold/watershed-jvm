@@ -16,10 +16,10 @@ doctest = false
 [dependencies]
 # The engine, at a commit of its own repository. Move `rev` forward to take
 # a newer engine (and run `sbt test`).
-watershed-core = { git = "https://github.com/surefold/watershed", rev = "7638f36f31c1e71c1df0d24100e2bfd72487bd4c" }
+watershed-core = { git = "https://github.com/surefold/watershed", rev = "703fafa5e2e95eced7df311b00f1997a5bf81a77" }
 # Plans: the graph run for many sets of inputs at once. With `cuda`, on an
 # NVIDIA GPU too; the CUDA libraries are found when a GPU is first asked for.
-watershed-gpu = { git = "https://github.com/surefold/watershed", rev = "7638f36f31c1e71c1df0d24100e2bfd72487bd4c" }
+watershed-gpu = { git = "https://github.com/surefold/watershed", rev = "703fafa5e2e95eced7df311b00f1997a5bf81a77" }
 
 [features]
 # Built against CUDA 13.1 (NVIDIA driver 580 or later), or with cuda-12 in its

@@ -60,7 +60,7 @@ class Plan internal constructor(make: (Plan) -> Long) {
  * was built without the `cuda` feature.
  */
 class Gpu {
-    private val address: Long = Native.gpu(this)
+    internal val address: Long = Native.gpu(this)
 
     /** The bytes of the GPU's memory that are free. */
     fun freeMemory(): Long = Native.gpuFreeMemory(address)
@@ -71,4 +71,75 @@ class Gpu {
      */
     fun run(plan: Plan, inputs: DoubleArray, allowed: Long = freeMemory() / 5 * 4): DoubleArray =
         Native.gpuRun(address, plan.address, inputs, plan.scenarios(inputs).toLong() * plan.outputs, allowed)
+}
+
+/**
+ * EXPERIMENTAL. What is kept of a plan so that a run of it can be brought up to date after a change. Make one
+ * with [Graph.kept]. It holds no values itself: run [plan], whose outputs are every kept value of a scenario,
+ * and give the answers to a [Held], or to several that each hold some of the scenarios.
+ *
+ * After inputs of the graph change (and `stabilize()`), [patch] gives what to run on the values held.
+ */
+class Kept internal constructor(make: (Kept) -> Long, private val patcher: (Long, List<Input<*>>) -> Long) {
+    private val address: Long = make(this)
+
+    /** The plan to run first: each scenario's answer is every kept value. */
+    val plan: Plan = Plan { owner -> Native.keptPlan(owner, address) }
+
+    /** Where each output is among a scenario's kept values. */
+    val outputColumns: IntArray = Native.keptColumns(address)
+
+    /** What to run now that [changed] have new values on the graph, or null if nothing kept uses them. */
+    fun patch(changed: List<Input<*>>): Patch? {
+        val patch = patcher(address, changed)
+        return if (patch == 0L) null else Patch { owner -> Native.ownPatch(owner, patch) }
+    }
+}
+
+/**
+ * EXPERIMENTAL. A small plan and which kept values it reads and works out again: what brings held values up to
+ * date after a change. It can be written to a file for whoever holds the values, in another process or on
+ * another machine.
+ */
+class Patch internal constructor(make: (Patch) -> Long) {
+    internal val address: Long = make(this)
+
+    private val sizes: LongArray = Native.patchSizes(address)
+
+    /** How many values are kept for a scenario. */
+    val width: Int get() = sizes[0].toInt()
+
+    /** How many of them the patch works out again. */
+    val stale: Int get() = sizes[1].toInt()
+
+    /** How many nodes it works out for each scenario to do so. */
+    val nodes: Long get() = sizes[2]
+
+    fun save(to: Path) = Native.patchSave(address, to.toString())
+
+    companion object {
+        /** Reads a patch written by [save]. */
+        fun load(from: Path): Patch = Patch { owner -> Native.patchLoad(owner, from.toString()) }
+    }
+}
+
+/**
+ * EXPERIMENTAL. Some scenarios' [inputs] ([vary] numbers to a scenario) and the kept [values] a [Kept.plan] gave
+ * for them, held in the engine to be brought up to date.
+ */
+class Held(vary: Int, inputs: DoubleArray, values: DoubleArray) {
+    private val address: Long = Native.held(this, vary, inputs, values)
+
+    /** How many scenarios are held. */
+    val scenarios: Int = inputs.size / vary
+
+    /** For each scenario in turn, its kept values in the places [columns], such as [Kept.outputColumns]. */
+    fun values(columns: IntArray): DoubleArray = Native.heldColumns(address, columns, scenarios.toLong() * columns.size)
+
+    /**
+     * Brings the values up to date with [patch], on [gpu] or, without one, on the CPU. Use what the first run
+     * used: where a model uses `exp`, `ln` or `pow`, a GPU and a CPU differ in the last digits.
+     */
+    fun refresh(patch: Patch, gpu: Gpu? = null, allowed: Long? = null) =
+        Native.heldRefresh(address, patch.address, gpu?.address ?: 0L, allowed ?: gpu?.let { it.freeMemory() / 5 * 4 } ?: 0L)
 }

@@ -90,3 +90,61 @@ class PlansTest {
         assertContentEquals(plan.runCpu(scenarios), gpu.run(plan, scenarios))
     }
 }
+
+class KeptTest {
+    // Accounts in groups, a sum for each group and a sum of those.
+    private val g = Graph()
+    private val rate = g.input("rate", 0.01)
+    private val shock = g.input("shock", 0.0)
+    private val floors = ArrayList<Input<Double>>()
+    private val groups: List<Node<Double>> = (0 until 5).map { a ->
+        val each = (0 until 4).map { b ->
+            val n = a * 4 + b
+            val floor = g.input("floor$n", 90.0 + n).also(floors::add)
+            var value = g.define("v${n}_0", (rate + 1.0) * (100.0 + n))
+            for (t in 1 until 6) value = g.define("v${n}_$t", value * (rate + 1.0) - shock)
+            g.define("worth$n", value + floor * shock)
+        }
+        g.define("group$a", each.drop(1).fold(each[0] as Expr<Double>) { all, x -> all + x })
+    }
+    private val total = g.define("total", groups.drop(1).fold(groups[0] as Expr<Double>) { all, x -> all + x })
+    private val scenarios = DoubleArray(100) { if (it % 2 == 0) 0.002 * it - 0.03 else 0.01 * (it % 7) }
+
+    @Test
+    fun `values held in two parts and patched from a file are what running it all again gives`() {
+        g.stabilize()
+        val kept = g.kept(vary = listOf(rate, shock), outputs = listOf(total), keep = groups)
+        val first = kept.plan.runCpu(scenarios)
+        val width = kept.plan.outputs
+        val parts = listOf(0 until 20, 20 until 50).map { part ->
+            Held(
+                2,
+                scenarios.copyOfRange(part.first * 2, (part.last + 1) * 2),
+                first.copyOfRange(part.first * width, (part.last + 1) * width),
+            )
+        }
+        val file = Files.createTempFile("watershed", ".patch")
+        try {
+            for ((n, to) in listOf(6 to 150.0, 19 to 20.0, 6 to 96.0)) {
+                g[floors[n]] = to
+                g.stabilize()
+                kept.patch(listOf(floors[n]))!!.save(file)
+                val patch = Patch.load(file)
+                // One group and the total.
+                assertEquals(2, patch.stale)
+                parts.forEach { it.refresh(patch) }
+
+                val again = g.kept(vary = listOf(rate, shock), outputs = listOf(total), keep = groups)
+                val whole = again.plan.runCpu(scenarios)
+                val all = IntArray(width) { it }
+                assertContentEquals(whole, parts[0].values(all) + parts[1].values(all))
+                val totals = DoubleArray(50) { whole[it * width + again.outputColumns[0]] }
+                assertContentEquals(totals, parts[0].values(kept.outputColumns) + parts[1].values(kept.outputColumns))
+            }
+        } finally {
+            Files.delete(file)
+        }
+        // An input nothing kept uses.
+        assertEquals(null, kept.patch(listOf(g.input("aside", 1.0))))
+    }
+}

@@ -154,6 +154,30 @@ class Graph {
     fun stabilize(): Report = Native.stabilize(address)
 
     /**
+     * EXPERIMENTAL. What to keep of a plan so that a run of it can be brought up to date after a change, without
+     * running it all again: the plan's [vary], [outputs] and [shared], as for [plan], and the nodes whose values
+     * to [keep] for every scenario, such as the sums over groups of rows. See [Kept].
+     */
+    fun kept(
+        vary: List<Input<Double>>,
+        outputs: List<Node<Double>>,
+        keep: List<Node<Double>>,
+        shared: List<Input<Double>> = emptyList(),
+    ): Kept = Kept(
+        { owner ->
+            Native.kept(
+                owner,
+                address,
+                IntArray(vary.size) { mine(vary[it]).id },
+                IntArray(shared.size) { mine(shared[it]).id },
+                IntArray(outputs.size) { mine(outputs[it]).id },
+                IntArray(keep.size) { mine(keep[it]).id },
+            )
+        },
+        { kept, changed -> Native.keptPatch(kept, address, IntArray(changed.size) { mine(changed[it]).id }) },
+    )
+
+    /**
      * EXPERIMENTAL. A plan of the graph as it stands, to run for many scenarios at once: each scenario gives a
      * value to every input in [vary], the [shared] inputs are the same in all of a run, and [outputs] are read.
      * Call [stabilize] first. Later changes to the graph do not reach the plan.

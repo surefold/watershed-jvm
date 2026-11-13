@@ -125,6 +125,25 @@ public final class Native {
     private static final MethodHandle GPU_RUN = function("ws_gpu_run", JAVA_INT,
             JAVA_LONG, JAVA_LONG, ADDRESS, JAVA_LONG, ADDRESS, JAVA_LONG, JAVA_LONG);
 
+    private static final MethodHandle KEPT_NEW = function("ws_kept_new", JAVA_LONG,
+            JAVA_LONG, ADDRESS, JAVA_LONG, ADDRESS, JAVA_LONG, ADDRESS, JAVA_LONG, ADDRESS, JAVA_LONG);
+    private static final MethodHandle KEPT_FREE = function("ws_kept_free", null, JAVA_LONG);
+    private static final MethodHandle KEPT_PLAN = function("ws_kept_plan", JAVA_LONG, JAVA_LONG);
+    private static final MethodHandle KEPT_COLUMNS = function("ws_kept_columns", JAVA_LONG, JAVA_LONG);
+    private static final MethodHandle KEPT_PATCH = function("ws_kept_patch", JAVA_INT,
+            JAVA_LONG, JAVA_LONG, ADDRESS, JAVA_LONG, ADDRESS);
+    private static final MethodHandle PATCH_FREE = function("ws_patch_free", null, JAVA_LONG);
+    private static final MethodHandle PATCH_SAVE = function("ws_patch_save", JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG);
+    private static final MethodHandle PATCH_LOAD = function("ws_patch_load", JAVA_LONG, ADDRESS, JAVA_LONG);
+    private static final MethodHandle PATCH_SIZES = function("ws_patch_sizes", JAVA_INT, JAVA_LONG, ADDRESS);
+    private static final MethodHandle HELD_NEW = function("ws_held_new", JAVA_LONG,
+            JAVA_LONG, ADDRESS, JAVA_LONG, ADDRESS, JAVA_LONG);
+    private static final MethodHandle HELD_FREE = function("ws_held_free", null, JAVA_LONG);
+    private static final MethodHandle HELD_COLUMNS = function("ws_held_columns", JAVA_INT,
+            JAVA_LONG, ADDRESS, JAVA_LONG, ADDRESS, JAVA_LONG);
+    private static final MethodHandle HELD_REFRESH = function("ws_held_refresh", JAVA_INT,
+            JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG);
+
     // Room for what a call writes back (up to four numbers), per thread, so
     // reading a value or running an update allocates nothing.
     private static final ThreadLocal<MemorySegment> OUT =
@@ -678,6 +697,136 @@ public final class Native {
             done((int) GPU_RUN.invokeExact(gpu, plan, doubles(arena, inputs), (long) inputs.length, out, results,
                     allowed));
             return out.asSlice(0, results * Double.BYTES).toArray(JAVA_DOUBLE);
+        } catch (Throwable thrown) {
+            throw impossible(thrown);
+        }
+    }
+
+    // ------------------------------------------------ keeping a run up to date
+
+    /**
+     * What to keep of a graph's plan so that a run can be brought up to date after a change, freed once nothing can
+     * reach {@code owner}: the plan's varied and shared inputs and its outputs, and the nodes whose values to keep.
+     */
+    public static long kept(Object owner, long graph, int[] vary, int[] shared, int[] outputs, int[] keep) {
+        try (Arena arena = Arena.ofConfined()) {
+            long address = address((long) KEPT_NEW.invokeExact(graph, ints(arena, vary), (long) vary.length,
+                    ints(arena, shared), (long) shared.length, ints(arena, outputs), (long) outputs.length,
+                    ints(arena, keep), (long) keep.length));
+            freeWith(owner, KEPT_FREE, address);
+            return address;
+        } catch (Throwable thrown) {
+            throw impossible(thrown);
+        }
+    }
+
+    /** The plan whose outputs are every kept value of a scenario, freed once nothing can reach {@code owner}. */
+    public static long keptPlan(Object owner, long kept) {
+        try {
+            long address = address((long) KEPT_PLAN.invokeExact(kept));
+            freeWith(owner, PLAN_FREE, address);
+            return address;
+        } catch (Throwable thrown) {
+            throw impossible(thrown);
+        }
+    }
+
+    /** Where each output is among a scenario's kept values. */
+    public static int[] keptColumns(long kept) {
+        try {
+            if ((long) KEPT_COLUMNS.invokeExact(kept) < 0) {
+                throw refused();
+            }
+            ByteBuffer bytes = ByteBuffer.wrap(kept(RESULT)).order(ByteOrder.LITTLE_ENDIAN);
+            int[] columns = new int[bytes.remaining() / Integer.BYTES];
+            bytes.asIntBuffer().get(columns);
+            return columns;
+        } catch (Throwable thrown) {
+            throw impossible(thrown);
+        }
+    }
+
+    /**
+     * What to run now that the inputs {@code changed} have new values on the graph: a patch's address, or 0 if nothing
+     * kept uses them. Give a patch to {@link #ownPatch} at once, so that it is freed.
+     */
+    public static long keptPatch(long kept, long graph, int[] changed) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = arena.allocate(JAVA_LONG);
+            done((int) KEPT_PATCH.invokeExact(kept, graph, ints(arena, changed), (long) changed.length, out));
+            return out.get(JAVA_LONG, 0);
+        } catch (Throwable thrown) {
+            throw impossible(thrown);
+        }
+    }
+
+    /** Has the patch at {@code address} freed once nothing can reach {@code owner}, and returns the address. */
+    public static long ownPatch(Object owner, long address) {
+        freeWith(owner, PATCH_FREE, address);
+        return address;
+    }
+
+    /** A patch read from a file written by {@link #patchSave}, freed once nothing can reach {@code owner}. */
+    public static long patchLoad(Object owner, String path) {
+        try (Arena arena = Arena.ofConfined()) {
+            byte[] at = utf8(path);
+            return ownPatch(owner, address((long) PATCH_LOAD.invokeExact(bytes(arena, at), (long) at.length)));
+        } catch (Throwable thrown) {
+            throw impossible(thrown);
+        }
+    }
+
+    /** Writes a patch to a file. */
+    public static void patchSave(long patch, String path) {
+        try (Arena arena = Arena.ofConfined()) {
+            byte[] at = utf8(path);
+            done((int) PATCH_SAVE.invokeExact(patch, bytes(arena, at), (long) at.length));
+        } catch (Throwable thrown) {
+            throw impossible(thrown);
+        }
+    }
+
+    /** How many values are kept for a scenario, how many of them a patch works out again, and on how many nodes. */
+    public static long[] patchSizes(long patch) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = arena.allocate(JAVA_LONG, 3);
+            done((int) PATCH_SIZES.invokeExact(patch, out));
+            return out.toArray(JAVA_LONG);
+        } catch (Throwable thrown) {
+            throw impossible(thrown);
+        }
+    }
+
+    /**
+     * Some scenarios' inputs ({@code vary} to a scenario) and the kept values a plan gave for them, copied into the
+     * engine and freed once nothing can reach {@code owner}.
+     */
+    public static long held(Object owner, int vary, double[] inputs, double[] values) {
+        try (Arena arena = Arena.ofConfined()) {
+            long address = address((long) HELD_NEW.invokeExact((long) vary, doubles(arena, inputs),
+                    (long) inputs.length, doubles(arena, values), (long) values.length));
+            freeWith(owner, HELD_FREE, address);
+            return address;
+        } catch (Throwable thrown) {
+            throw impossible(thrown);
+        }
+    }
+
+    /** For each scenario held in turn, its kept values in the places {@code columns}: {@code results} values in all. */
+    public static double[] heldColumns(long held, int[] columns, long results) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = arena.allocate(JAVA_DOUBLE, Math.max(results, 1));
+            done((int) HELD_COLUMNS.invokeExact(held, ints(arena, columns), (long) columns.length, out, results));
+            return out.asSlice(0, results * Double.BYTES).toArray(JAVA_DOUBLE);
+        } catch (Throwable thrown) {
+            throw impossible(thrown);
+        }
+    }
+
+    /** Brings held values up to date with a patch, on the GPU within {@code allowed} bytes, or on the CPU if {@code gpu} is 0. */
+    public static void heldRefresh(long held, long patch, long gpu, long allowed) {
+        try {
+            done((int) HELD_REFRESH.invokeExact(held, patch, gpu, allowed));
         } catch (Throwable thrown) {
             throw impossible(thrown);
         }
