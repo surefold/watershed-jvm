@@ -562,3 +562,393 @@ pub unsafe extern "C" fn ws_rows(address: i64) -> i64 {
     // SAFETY: see the top of this file.
     attempt(-1, || Ok(unsafe { collection(address) }.size()))
 }
+
+// ---------------------------------------------------------------------- plans
+
+use crate::plan::{Gpu, Held, Kept, Patch, Plan};
+
+/// SAFETY: `address` is a live plan: it came from `ws_plan_new` or
+/// `ws_plan_load` and has not been freed.
+unsafe fn plan<'a>(address: i64) -> &'a Plan {
+    unsafe { &*(address as *const Plan) }
+}
+
+/// SAFETY: `at` points to `count` readable items.
+unsafe fn items<'a, T>(at: *const T, count: i64) -> Result<&'a [T]> {
+    match usize::try_from(count) {
+        Ok(0) => Ok(&[]),
+        Ok(count) => Ok(unsafe { std::slice::from_raw_parts(at, count) }),
+        Err(_) => Err("a count passed in is negative".to_string()),
+    }
+}
+
+/// SAFETY: `at` points to `length` readable bytes.
+unsafe fn path<'a>(at: *const u8, length: i64) -> Result<&'a str> {
+    std::str::from_utf8(unsafe { bytes(at, length) }).map_err(|e| e.to_string())
+}
+
+/// A plan of the graph as it stands: the nodes to vary in every scenario,
+/// those shared by all of a run, and the outputs. Returns its address, to
+/// be freed with `ws_plan_free`, or 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_plan_new(
+    address: i64,
+    vary: *const i32,
+    varied: i64,
+    shared: *const i32,
+    sharing: i64,
+    outputs: *const i32,
+    read: i64,
+) -> i64 {
+    attempt(0, || {
+        // SAFETY: see the top of this file; each list has its count of items.
+        let (graph, vary, shared, outputs) = unsafe {
+            (
+                graph(address),
+                items(vary, varied)?,
+                items(shared, sharing)?,
+                items(outputs, read)?,
+            )
+        };
+        Plan::new(graph, vary, shared, outputs).map(|plan| Box::into_raw(Box::new(plan)) as i64)
+    })
+}
+
+/// Frees a plan. Its address must not be used again.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_plan_free(address: i64) {
+    if address != 0 {
+        // SAFETY: it came from `ws_plan_new` or `ws_plan_load` and is freed once.
+        drop(unsafe { Box::from_raw(address as *mut Plan) });
+    }
+}
+
+/// Writes a plan to the file at a path (UTF-8).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_plan_save(address: i64, at: *const u8, length: i64) -> i32 {
+    attempt(REFUSED, || {
+        // SAFETY: see the top of this file.
+        let (plan, path) = unsafe { (plan(address), path(at, length)?) };
+        plan.save(path).map(|()| DONE)
+    })
+}
+
+/// Reads a plan from the file at a path. Returns its address, or 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_plan_load(at: *const u8, length: i64) -> i64 {
+    attempt(0, || {
+        // SAFETY: see the top of this file.
+        let path = unsafe { path(at, length)? };
+        Plan::load(path).map(|plan| Box::into_raw(Box::new(plan)) as i64)
+    })
+}
+
+/// Writes four numbers to `out`: how many varied inputs, shared inputs and
+/// outputs the plan has, and how many nodes it works out for a scenario.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_plan_sizes(address: i64, out: *mut i64) -> i32 {
+    attempt(REFUSED, || {
+        // SAFETY: see the top of this file; `out` has room for four.
+        unsafe {
+            let sizes = plan(address).sizes();
+            std::ptr::copy_nonoverlapping(sizes.as_ptr(), out, 4);
+        }
+        Ok(DONE)
+    })
+}
+
+/// Gives the plan's shared inputs new values, for every run from now on.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_plan_set_shared(address: i64, values: *const f64, count: i64) -> i32 {
+    attempt(REFUSED, || {
+        // SAFETY: see the top of this file.
+        let (plan, values) = unsafe { (plan(address), items(values, count)?) };
+        plan.set_shared(values).map(|()| DONE)
+    })
+}
+
+/// SAFETY: `at` points to `count` writable numbers.
+unsafe fn room<'a>(at: *mut f64, count: i64) -> Result<&'a mut [f64]> {
+    match usize::try_from(count) {
+        Ok(0) => Ok(&mut []),
+        Ok(count) => Ok(unsafe { std::slice::from_raw_parts_mut(at, count) }),
+        Err(_) => Err("a count passed in is negative".to_string()),
+    }
+}
+
+/// Runs scenarios on the CPU. `inputs` holds one scenario after another;
+/// `out` must have room for every scenario's outputs, and gets them.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_plan_run_cpu(
+    address: i64,
+    inputs: *const f64,
+    count: i64,
+    out: *mut f64,
+    space: i64,
+) -> i32 {
+    attempt(REFUSED, || {
+        // SAFETY: see the top of this file.
+        let (plan, inputs, out) =
+            unsafe { (plan(address), items(inputs, count)?, room(out, space)?) };
+        plan.run_cpu(inputs, out).map(|()| DONE)
+    })
+}
+
+/// An NVIDIA GPU to run plans on. Returns its address, to be freed with
+/// `ws_gpu_free`, or 0 (there is none, or the library was built without).
+#[unsafe(no_mangle)]
+pub extern "C" fn ws_gpu_new() -> i64 {
+    attempt(0, || {
+        Gpu::new().map(|gpu| Box::into_raw(Box::new(gpu)) as i64)
+    })
+}
+
+/// Frees a GPU. Its address must not be used again.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_gpu_free(address: i64) {
+    if address != 0 {
+        // SAFETY: it came from `ws_gpu_new` and is freed once.
+        drop(unsafe { Box::from_raw(address as *mut Gpu) });
+    }
+}
+
+/// The bytes of the GPU's memory that are free, or -1.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_gpu_free_memory(address: i64) -> i64 {
+    // SAFETY: `address` is a live GPU.
+    attempt(-1, || unsafe { &*(address as *const Gpu) }.free_memory())
+}
+
+/// Runs scenarios on the GPU, as `ws_plan_run_cpu` does on the CPU, in as
+/// many parts as fit in `allowed` bytes of the GPU's memory.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_gpu_run(
+    address: i64,
+    of: i64,
+    inputs: *const f64,
+    count: i64,
+    out: *mut f64,
+    space: i64,
+    allowed: i64,
+) -> i32 {
+    attempt(REFUSED, || {
+        // SAFETY: see the top of this file; `address` is a live GPU.
+        let (gpu, plan, inputs, out) = unsafe {
+            (
+                &*(address as *const Gpu),
+                plan(of),
+                items(inputs, count)?,
+                room(out, space)?,
+            )
+        };
+        gpu.run(plan, inputs, out, allowed).map(|()| DONE)
+    })
+}
+
+// ----------------------------------------------- keeping a run up to date
+
+/// What to keep of a graph's plan so that a run can be brought up to date
+/// after a change: the plan's `vary`, `shared` and `outputs`, and the nodes
+/// whose values to `keep`. Returns its address, to be freed with
+/// `ws_kept_free`, or 0.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn ws_kept_new(
+    address: i64,
+    vary: *const i32,
+    varied: i64,
+    shared: *const i32,
+    sharing: i64,
+    outputs: *const i32,
+    read: i64,
+    keep: *const i32,
+    keeping: i64,
+) -> i64 {
+    attempt(0, || {
+        // SAFETY: see the top of this file; each list has its count of items.
+        let (graph, vary, shared, outputs, keep) = unsafe {
+            (
+                graph(address),
+                items(vary, varied)?,
+                items(shared, sharing)?,
+                items(outputs, read)?,
+                items(keep, keeping)?,
+            )
+        };
+        Kept::new(graph, vary, shared, outputs, keep)
+            .map(|kept| Box::into_raw(Box::new(kept)) as i64)
+    })
+}
+
+/// Frees what `ws_kept_new` gave.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_kept_free(address: i64) {
+    if address != 0 {
+        // SAFETY: it came from `ws_kept_new` and is freed once.
+        drop(unsafe { Box::from_raw(address as *mut Kept) });
+    }
+}
+
+/// SAFETY: `address` came from `ws_kept_new` and has not been freed.
+unsafe fn kept<'a>(address: i64) -> &'a Kept {
+    unsafe { &*(address as *const Kept) }
+}
+
+/// The plan whose outputs are every kept value of a scenario: a plan of its
+/// own, to be freed with `ws_plan_free`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_kept_plan(address: i64) -> i64 {
+    // SAFETY: see `kept`.
+    attempt(0, || {
+        Ok(Box::into_raw(Box::new(unsafe { kept(address) }.plan())) as i64)
+    })
+}
+
+/// Where each output is among a scenario's kept values: four bytes each,
+/// least significant first, read with `ws_result`. Returns their length.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_kept_columns(address: i64) -> i64 {
+    attempt(-1, || {
+        // SAFETY: see `kept`.
+        let columns = unsafe { kept(address) }.columns();
+        Ok(result(|bytes| {
+            columns
+                .iter()
+                .for_each(|c| bytes.extend_from_slice(&c.to_le_bytes()))
+        }))
+    })
+}
+
+/// What to run now that `count` inputs have new values on the graph: writes
+/// a patch's address to `out`, to be freed with `ws_patch_free`, or 0 if
+/// nothing kept uses them.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_kept_patch(
+    address: i64,
+    of: i64,
+    changed: *const i32,
+    count: i64,
+    out: *mut i64,
+) -> i32 {
+    attempt(REFUSED, || {
+        // SAFETY: see the top of this file; `out` has room for one.
+        let (kept, graph, changed) = unsafe { (kept(address), graph(of), items(changed, count)?) };
+        let patch = kept.patch(graph, changed)?;
+        let address = patch.map_or(0, |patch| Box::into_raw(Box::new(patch)) as i64);
+        // SAFETY: as above.
+        unsafe { *out = address };
+        Ok(DONE)
+    })
+}
+
+/// SAFETY: `address` came from `ws_kept_patch` or `ws_patch_load` and has
+/// not been freed.
+unsafe fn patch<'a>(address: i64) -> &'a Patch {
+    unsafe { &*(address as *const Patch) }
+}
+
+/// Frees a patch.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_patch_free(address: i64) {
+    if address != 0 {
+        // SAFETY: it came from `ws_kept_patch` or `ws_patch_load` and is freed once.
+        drop(unsafe { Box::from_raw(address as *mut Patch) });
+    }
+}
+
+/// Writes a patch to the file at a path (UTF-8).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_patch_save(address: i64, at: *const u8, length: i64) -> i32 {
+    attempt(REFUSED, || {
+        // SAFETY: see the top of this file.
+        let (patch, path) = unsafe { (patch(address), path(at, length)?) };
+        patch.save(path).map(|()| DONE)
+    })
+}
+
+/// Reads a patch from the file at a path. Returns its address, or 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_patch_load(at: *const u8, length: i64) -> i64 {
+    attempt(0, || {
+        // SAFETY: see the top of this file.
+        let path = unsafe { path(at, length)? };
+        Patch::load(path).map(|patch| Box::into_raw(Box::new(patch)) as i64)
+    })
+}
+
+/// Writes three numbers to `out`: how many values are kept for a scenario,
+/// how many of them the patch works out again, and on how many nodes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_patch_sizes(address: i64, out: *mut i64) -> i32 {
+    attempt(REFUSED, || {
+        // SAFETY: see the top of this file; `out` has room for three.
+        unsafe {
+            let sizes = patch(address).sizes();
+            std::ptr::copy_nonoverlapping(sizes.as_ptr(), out, 3);
+        }
+        Ok(DONE)
+    })
+}
+
+/// Holds some scenarios' inputs (`vary` to a scenario) and the kept values
+/// a plan gave for them, copied. Returns an address, to be freed with
+/// `ws_held_free`, or 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_held_new(
+    vary: i64,
+    inputs: *const f64,
+    count: i64,
+    values: *const f64,
+    kept: i64,
+) -> i64 {
+    attempt(0, || {
+        // SAFETY: see the top of this file.
+        let (inputs, values) = unsafe { (items(inputs, count)?, items(values, kept)?) };
+        Held::new(vary, inputs, values).map(|held| Box::into_raw(Box::new(held)) as i64)
+    })
+}
+
+/// Frees what `ws_held_new` gave.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_held_free(address: i64) {
+    if address != 0 {
+        // SAFETY: it came from `ws_held_new` and is freed once.
+        drop(unsafe { Box::from_raw(address as *mut Held) });
+    }
+}
+
+/// Writes to `out`, for each scenario held in turn, its kept values in the
+/// `count` places `columns`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_held_columns(
+    address: i64,
+    columns: *const i32,
+    count: i64,
+    out: *mut f64,
+    space: i64,
+) -> i32 {
+    attempt(REFUSED, || {
+        // SAFETY: see the top of this file; `address` came from `ws_held_new`.
+        let (held, columns, out) = unsafe {
+            (
+                &*(address as *const Held),
+                items(columns, count)?,
+                room(out, space)?,
+            )
+        };
+        held.columns(columns, out).map(|()| DONE)
+    })
+}
+
+/// Brings held values up to date with a patch: on the GPU at `gpu`, within
+/// `allowed` bytes of its memory, or on the CPU if `gpu` is 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_held_refresh(address: i64, with: i64, gpu: i64, allowed: i64) -> i32 {
+    attempt(REFUSED, || {
+        // SAFETY: `address` came from `ws_held_new`, `with` is a live patch,
+        // and `gpu` is 0 or a live GPU.
+        let (held, patch) = unsafe { (&*(address as *const Held), patch(with)) };
+        let gpu = (gpu != 0).then(|| (unsafe { &*(gpu as *const Gpu) }, allowed));
+        held.refresh(patch, gpu).map(|()| DONE)
+    })
+}

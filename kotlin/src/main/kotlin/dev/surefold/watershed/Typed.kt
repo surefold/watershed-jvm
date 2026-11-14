@@ -18,21 +18,38 @@
 // engine, and never mixes with a Double by accident.
 //
 // Underneath, every call goes straight to the engine's C functions through
-// the JDK's foreign function API (see Native.java), in tens of nanoseconds.
+// the JDK's foreign function API (see Native.kt), in tens of nanoseconds.
+//
+// Nothing here throws. A call the engine can refuse is made in a scope that
+// declares it, `attempt<Refused, _> { ... }` or a function with
+// `context(_: Fail<Refused>)`, and a refusal is that scope's failure.
 
 @file:JvmName("Typed")
 @file:Suppress("UNCHECKED_CAST")
 
 package dev.surefold.watershed
 
+import dev.surefold.fail.Either
+import dev.surefold.fail.Fail
+import dev.surefold.fail.bind
+import dev.surefold.fail.ensure
+import dev.surefold.fail.fail
+import dev.surefold.fail.flatMap
+import dev.surefold.fail.left
+import dev.surefold.fail.map
+import dev.surefold.fail.right
+import dev.surefold.fail.traverse
 import java.math.BigDecimal
 import java.math.RoundingMode
 
-/** Something that works out to a [T]: a node, a constant, or a calculation over them. */
-open class Expr<T> internal constructor(internal val steps: ByteArray)
+/**
+ * Something that works out to a [T]: a node, a constant, or a calculation over them. One written with a value the
+ * engine cannot hold carries why, and is refused where it is used.
+ */
+open class Expr<T> internal constructor(internal val steps: Either<Refused, ByteArray>)
 
 /** A node of a graph holding a [T]. */
-open class Node<T> internal constructor(internal val graph: Graph, val id: Int) : Expr<T>(Wire.node(id)) {
+open class Node<T> internal constructor(internal val graph: Graph, val id: Int) : Expr<T>(Wire.node(id).right()) {
     override fun equals(other: Any?) = other is Node<*> && other.graph === graph && other.id == id
     override fun hashCode() = id.hashCode()
     override fun toString() = "Node($id)"
@@ -42,7 +59,7 @@ open class Node<T> internal constructor(internal val graph: Graph, val id: Int) 
 class Input<T> internal constructor(graph: Graph, id: Int) : Node<T>(graph, id)
 
 /** A field or calculated column of a collection's rows, holding a [T] in each row. */
-open class Part<T> internal constructor(val name: String) : Expr<T>(Wire.part(name))
+open class Part<T> internal constructor(val name: String) : Expr<T>(Wire.part(name).right())
 
 /** A field: the part of a row that is given, not calculated. */
 class Field<T> internal constructor(name: String) : Part<T>(name)
@@ -57,17 +74,19 @@ fun row(key: String, vararg fields: FieldValue) = Row(key, fields)
 
 // ------------------------------------------------------------------ values
 
-/** What the engine gave back, as the type the node holds; a failure throws, with why. */
+/** What the engine gave back, as the type the node holds; one that could not be calculated is refused, with why. */
+context(_: Fail<Refused>)
 private fun <T> read(held: Any, what: () -> String): T = when (held) {
-    is Native.Failed -> throw WatershedException("${what()} could not be calculated: ${held.why}")
+    is Native.Failed -> fail(Refused("${what()} could not be calculated: ${held.why}"))
     else -> held
 } as T
 
 private fun <T> constant(value: Any) = Expr<T>(Wire.constant(value))
 
-private fun <T> unary(op: Byte, a: Expr<*>) = Expr<T>(Wire.unary(op, a.steps))
+private fun <T> unary(op: Byte, a: Expr<*>) = Expr<T>(a.steps.map { Wire.unary(op, it) })
 
-private fun <T> binary(op: Byte, a: Expr<*>, b: Expr<*>) = Expr<T>(Wire.binary(op, a.steps, b.steps))
+private fun <T> binary(op: Byte, a: Expr<*>, b: Expr<*>) =
+    Expr<T>(a.steps.flatMap { first -> b.steps.map { second -> Wire.binary(op, first, second) } })
 
 /** A constant, for where a value alone would not say which type is meant. */
 fun <T : Any> value(value: T): Expr<T> = constant(if (value is Int) value.toLong() else value)
@@ -75,162 +94,229 @@ fun <T : Any> value(value: T): Expr<T> = constant(if (value is Int) value.toLong
 // ------------------------------------------------------------------- graph
 
 /** A graph of inputs and calculated nodes. */
-class Graph {
-    // Where the graph is in the engine. It is freed when this object can no longer be reached.
-    private val address: Long = Native.graph(this)
+class Graph private constructor(private val address: Long) {
+    init {
+        // Freed in the engine when this object can no longer be reached.
+        Native.ownGraph(this, address)
+    }
 
+    companion object {
+        /** A new, empty graph: `Graph()`. Refused if the engine's library cannot be found. */
+        context(_: Fail<Refused>)
+        operator fun invoke(): Graph = Graph(Native.graph())
+    }
+
+    context(_: Fail<Refused>)
     private fun <N : Node<*>> mine(node: N): N {
-        if (node.graph !== this) throw WatershedException("that node belongs to another graph")
+        ensure(node.graph === this) { Refused("that node belongs to another graph") }
         return node
     }
 
+    context(_: Fail<Refused>)
     fun input(name: String, value: Double): Input<Double> = Input(this, Native.input(address, name, value))
+    context(_: Fail<Refused>)
     fun input(name: String, value: Long): Input<Long> = Input(this, Native.input(address, name, value))
+    context(_: Fail<Refused>)
     fun input(name: String, value: BigDecimal): Input<BigDecimal> = Input(this, Native.input(address, name, value))
+    context(_: Fail<Refused>)
     fun input(name: String, value: Boolean): Input<Boolean> = Input(this, Native.input(address, name, value))
+    context(_: Fail<Refused>)
     fun input(name: String, value: String): Input<String> = Input(this, Native.input(address, name, value))
 
     /** Adds a calculated node. */
-    fun <T> define(name: String, expression: Expr<T>): Node<T> = Node(this, Native.define(address, name, expression.steps))
+    context(_: Fail<Refused>)
+    fun <T> define(name: String, expression: Expr<T>): Node<T> = Node(this, Native.define(address, name, expression.steps.bind()))
 
     /** Adds many calculated nodes in one call, in order. */
+    context(_: Fail<Refused>)
     fun <T> defineAll(definitions: List<Pair<String, Expr<T>>>): List<Node<T>> =
-        Native.defineMany(address, definitions.map { it.first }, definitions.map { it.second.steps })
+        Native.defineMany(address, definitions.map { it.first }, definitions.map { it.second.steps.bind() })
             .map { Node(this, it) }
 
     /** Records a new value for an input; it counts from the next `stabilize()`. */
     @JvmName("setNumber")
+    context(_: Fail<Refused>)
     operator fun set(input: Input<Double>, value: Double) = Native.setNumber(address, mine(input).id, value)
 
     @JvmName("setNumberToWhole")
+    context(_: Fail<Refused>)
     operator fun set(input: Input<Double>, value: Int) = Native.setNumber(address, mine(input).id, value.toDouble())
 
     @JvmName("setWhole")
+    context(_: Fail<Refused>)
     operator fun set(input: Input<Long>, value: Long) = Native.setWhole(address, mine(input).id, value)
 
     @JvmName("setWholeToInt")
+    context(_: Fail<Refused>)
     operator fun set(input: Input<Long>, value: Int) = Native.setWhole(address, mine(input).id, value.toLong())
 
     @JvmName("setDecimal")
+    context(_: Fail<Refused>)
     operator fun set(input: Input<BigDecimal>, value: BigDecimal) = Native.setDecimal(address, mine(input).id, value)
 
     @JvmName("setDecimalToWhole")
+    context(_: Fail<Refused>)
     operator fun set(input: Input<BigDecimal>, value: Int) = Native.setDecimal(address, mine(input).id, value.toBigDecimal())
 
     @JvmName("setFlag")
+    context(_: Fail<Refused>)
     operator fun set(input: Input<Boolean>, value: Boolean) = Native.setFlag(address, mine(input).id, value)
 
     @JvmName("setText")
+    context(_: Fail<Refused>)
     operator fun set(input: Input<String>, value: String) = Native.setText(address, mine(input).id, value)
 
     /** Sets many Double inputs in one call: the way to apply a batch of prices. */
+    context(_: Fail<Refused>)
     fun setAll(values: Map<Input<Double>, Double>) {
-        val nodes = IntArray(values.size)
-        val numbers = DoubleArray(values.size)
-        var at = 0
-        for ((input, value) in values) {
-            nodes[at] = mine(input).id
-            numbers[at] = value
-            at += 1
-        }
-        Native.setNumbers(address, nodes, numbers)
+        val each = values.entries.toList()
+        Native.setNumbers(address, IntArray(each.size) { mine(each[it].key).id }, DoubleArray(each.size) { each[it].value })
     }
 
-    /** The node's value as of the last update. A node that could not be calculated throws, with why. */
+    /** The node's value as of the last update. A node that could not be calculated is refused, with why. */
+    context(_: Fail<Refused>)
     operator fun <T> get(node: Node<T>): T =
         read(Native.value(address, mine(node).id)) { Native.name(address, node.id) }
 
     /** A Double is read as a plain number, with nothing made on the way. */
     @JvmName("getNumber")
+    context(_: Fail<Refused>)
     operator fun get(node: Node<Double>): Double = Native.number(address, mine(node).id)
 
-    /** The node's value, or null if it could not be calculated. */
-    fun <T> getOrNull(node: Node<T>): T? = when (val held = Native.value(address, mine(node).id)) {
-        is Native.Failed -> null
-        else -> held as T
-    }
-
     /** Applies every recorded change and recalculates what depends on them, and nothing else. */
+    context(_: Fail<Refused>)
     fun stabilize(): Report = Native.stabilize(address)
 
+    /**
+     * EXPERIMENTAL. What to keep of a plan so that a run of it can be brought up to date after a change, without
+     * running it all again: the plan's [vary], [outputs] and [shared], as for [plan], and the nodes whose values
+     * to [keep] for every scenario, such as the sums over groups of rows. See [Kept].
+     */
+    context(_: Fail<Refused>)
+    fun kept(
+        vary: List<Input<Double>>,
+        outputs: List<Node<Double>>,
+        keep: List<Node<Double>>,
+        shared: List<Input<Double>> = emptyList(),
+    ): Kept {
+        val kept = Native.kept(address, ids(vary), ids(shared), ids(outputs), ids(keep))
+        return Kept(this, kept, Plan.of(Native.keptPlan(kept)), Native.keptColumns(kept))
+    }
+
+    context(_: Fail<Refused>)
+    private fun ids(nodes: List<Node<*>>): IntArray = IntArray(nodes.size) { mine(nodes[it]).id }
+
+    // The patch, for a [Kept] of this graph, now that [changed] have new values; 0 if nothing kept uses them.
+    context(_: Fail<Refused>)
+    internal fun patch(kept: Long, changed: List<Input<*>>): Long = Native.keptPatch(kept, address, ids(changed))
+
+    /**
+     * EXPERIMENTAL. A plan of the graph as it stands, to run for many scenarios at once: each scenario gives a
+     * value to every input in [vary], the [shared] inputs are the same in all of a run, and [outputs] are read.
+     * Call [stabilize] first. Later changes to the graph do not reach the plan.
+     */
+    context(_: Fail<Refused>)
+    fun plan(vary: List<Input<Double>>, outputs: List<Node<Double>>, shared: List<Input<Double>> = emptyList()): Plan =
+        Plan.of(Native.plan(address, ids(vary), ids(shared), ids(outputs)))
+
     /** Why the node has its value, as a tree of what it was worked out from. */
+    context(_: Fail<Refused>)
     fun explain(node: Node<*>): String = Native.explain(address, mine(node).id)
 
     /** The names of the nodes the last update recalculated, in order. */
+    context(_: Fail<Refused>)
     fun lastRecalculated(): List<String> = Native.lastRecalculated(address)
 
     /** How many nodes the graph has had. */
     fun size(): Long = Native.size(address)
 
     /** Removes a node that nothing uses; its name is then free. */
+    context(_: Fail<Refused>)
     fun remove(node: Node<*>) = Native.remove(address, mine(node).id)
 
     /** Watches a node: in pull mode, it and what it uses are kept up to date. */
+    context(_: Fail<Refused>)
     fun watch(node: Node<*>) = Native.watch(address, mine(node).id, true)
+    context(_: Fail<Refused>)
     fun unwatch(node: Node<*>) = Native.watch(address, mine(node).id, false)
 
     /** Pull mode: while on, an update calculates only the watched nodes and what they use. */
+    context(_: Fail<Refused>)
     fun calculateOnlyWatched(on: Boolean) = Native.calculateOnlyWatched(address, on)
 
     /** Checks every node against a calculation from scratch. */
+    context(_: Fail<Refused>)
     fun checkConsistency() = Native.checkConsistency(address)
 
     /** A new, empty keyed table of rows in this graph. */
-    fun collection(name: String): Collection = Collection(this, address, name)
+    context(_: Fail<Refused>)
+    fun collection(name: String): Collection = Collection(this, Native.collection(address, name))
 }
 
 // -------------------------------------------------------------- collection
 
 /** A keyed table of rows, with fields, calculated columns and totals that update by only the rows that change. */
-class Collection internal constructor(private val graph: Graph, graphAddress: Long, name: String) {
-    // Holding `graph` keeps the graph alive for as long as this is.
-    private val address: Long = Native.collection(this, graphAddress, name)
+class Collection internal constructor(private val graph: Graph, private val address: Long) {
+    init {
+        // Freed in the engine when this can no longer be reached; holding `graph` keeps the graph alive until then.
+        Native.ownCollection(this, address)
+    }
 
+    context(_: Fail<Refused>)
     private fun <T> field(name: String, kind: Byte): Field<T> {
         Native.field(address, name, kind)
         return Field(name)
     }
 
+    context(_: Fail<Refused>)
     fun number(name: String): Field<Double> = field(name, Wire.NUMBER)
+    context(_: Fail<Refused>)
     fun whole(name: String): Field<Long> = field(name, Wire.WHOLE)
+    context(_: Fail<Refused>)
     fun decimal(name: String): Field<BigDecimal> = field(name, Wire.DECIMAL)
+    context(_: Fail<Refused>)
     fun flag(name: String): Field<Boolean> = field(name, Wire.FLAG)
+    context(_: Fail<Refused>)
     fun text(name: String): Field<String> = field(name, Wire.TEXT)
 
     /** Adds a column, worked out in every row from its fields, other columns and any node. */
+    context(_: Fail<Refused>)
     fun <T> column(name: String, expression: Expr<T>): Part<T> {
-        Native.column(address, name, expression.steps)
+        Native.column(address, name, expression.steps.bind())
         return Part(name)
     }
 
+    context(_: Fail<Refused>)
     fun <T : Number> sum(name: String, of: Part<T>): Node<T> = Node(graph, Native.total(address, name, Wire.SUM, of.name))
+    context(_: Fail<Refused>)
     fun <T : Number> min(name: String, of: Part<T>): Node<T> = Node(graph, Native.total(address, name, Wire.SMALLEST, of.name))
+    context(_: Fail<Refused>)
     fun <T : Number> max(name: String, of: Part<T>): Node<T> = Node(graph, Native.total(address, name, Wire.LARGEST, of.name))
+    context(_: Fail<Refused>)
     fun count(name: String): Node<Long> = Node(graph, Native.total(address, name, Wire.COUNT, null))
 
-    private fun write(to: Wire, key: String, fields: Array<out FieldValue>) {
-        to.put(key).put(fields.size)
-        for (field in fields) to.put(field.name).value(field.value)
-    }
+    context(_: Fail<Refused>)
+    private fun write(to: Wire, key: String, fields: Array<out FieldValue>): Wire =
+        fields.fold(to.put(key).put(fields.size)) { wire, field -> wire.put(field.name).value(field.value).bind() }
 
     /** Adds a row, or changes the fields given of one that is there: `orders.upsert("o-1", qty(2.0), price(9.99))`. */
+    context(_: Fail<Refused>)
     fun upsert(key: String, vararg fields: FieldValue) {
-        val wire = Wire()
-        write(wire, key, fields)
-        Native.upsert(address, wire.bytes(), 1)
+        Native.upsert(address, write(Wire(), key, fields).bytes(), 1)
     }
 
     /** Adds or changes many rows in one call: `orders.upsertAll(listOf(row("o-1", qty(2.0)), ...))`. */
+    context(_: Fail<Refused>)
     fun upsertAll(rows: List<Row>) {
-        val wire = Wire()
-        for (row in rows) write(wire, row.key, row.fields)
-        Native.upsert(address, wire.bytes(), rows.size)
+        Native.upsert(address, rows.fold(Wire()) { wire, row -> write(wire, row.key, row.fields) }.bytes(), rows.size)
     }
 
     /** Removes a row. Says whether there was one. */
+    context(_: Fail<Refused>)
     fun remove(key: String): Boolean = Native.removeRow(address, key)
 
     /** A field or column of a row, as of the last update: `orders["o-1", line]`. */
+    context(_: Fail<Refused>)
     operator fun <T> get(key: String, part: Part<T>): T =
         read(Native.rowValue(address, key, part.name)) { "$key.${part.name}" }
 
@@ -269,14 +355,14 @@ infix fun <T : Any> Expr<T>.ne(other: T): Expr<Boolean> = binary(Wire.NOT_EQUAL,
 
 /** `whenever(condition, then, otherwise)`: only the chosen one is worked out. */
 fun <T> whenever(condition: Expr<Boolean>, then: Expr<T>, otherwise: Expr<T>): Expr<T> =
-    Expr(Wire.choice(condition.steps, then.steps, otherwise.steps))
+    Expr(condition.steps.flatMap { c -> then.steps.flatMap { t -> otherwise.steps.map { o -> Wire.choice(c, t, o) } } })
 
 fun <T : Any> whenever(condition: Expr<Boolean>, then: T, otherwise: T): Expr<T> =
     whenever(condition, constant<T>(then), constant<T>(otherwise))
 
 /** The option at position `index`, counting from 0; only that one is worked out. */
 fun <T> choose(index: Expr<Long>, vararg options: Expr<T>): Expr<T> =
-    Expr(Wire.choose(index.steps, options.map { it.steps }))
+    Expr(index.steps.flatMap { i -> options.asList().traverse<Refused, Expr<T>, ByteArray> { it.steps.bind() }.map { Wire.choose(i, it) } })
 
 @JvmName("concatText")
 operator fun Expr<String>.plus(other: Expr<String>): Expr<String> = binary(Wire.CONCAT, this, other)
@@ -285,7 +371,7 @@ operator fun Expr<String>.plus(other: String): Expr<String> = binary(Wire.CONCAT
 
 /** A list of these strings, in this order. */
 fun texts(vararg items: Expr<String>): Expr<List<String>> =
-    Expr(Wire.texts(items.map { it.steps }))
+    Expr(items.asList().traverse<Refused, Expr<String>, ByteArray> { it.steps.bind() }.map { Wire.texts(it) })
 
 @JvmName("concatTexts")
 operator fun Expr<List<String>>.plus(other: Expr<List<String>>): Expr<List<String>> = binary(Wire.CONCAT, this, other)
@@ -389,16 +475,14 @@ fun Expr<List<String>>.join(separator: String): Expr<String> = binary(Wire.JOIN,
 fun Expr<BigDecimal>.round(places: Int, rounding: RoundingMode = RoundingMode.HALF_EVEN): Expr<BigDecimal> =
     round(constant<Long>(places.toLong()), rounding)
 
-fun Expr<BigDecimal>.round(places: Expr<Long>, rounding: RoundingMode = RoundingMode.HALF_EVEN): Expr<BigDecimal> {
-    val op: Byte = when (rounding) {
-        RoundingMode.HALF_EVEN -> Wire.ROUND_HALF_EVEN
-        RoundingMode.HALF_UP -> Wire.ROUND_HALF_UP
-        RoundingMode.DOWN -> Wire.ROUND_DOWN
-        RoundingMode.UP -> Wire.ROUND_UP
-        else -> throw IllegalArgumentException("rounding is HALF_EVEN, HALF_UP, DOWN or UP, not $rounding")
+fun Expr<BigDecimal>.round(places: Expr<Long>, rounding: RoundingMode = RoundingMode.HALF_EVEN): Expr<BigDecimal> =
+    when (rounding) {
+        RoundingMode.HALF_EVEN -> binary(Wire.ROUND_HALF_EVEN, this, places)
+        RoundingMode.HALF_UP -> binary(Wire.ROUND_HALF_UP, this, places)
+        RoundingMode.DOWN -> binary(Wire.ROUND_DOWN, this, places)
+        RoundingMode.UP -> binary(Wire.ROUND_UP, this, places)
+        else -> Expr(Refused("rounding is HALF_EVEN, HALF_UP, DOWN or UP, not $rounding").left())
     }
-    return binary(op, this, places)
-}
 
 /** A whole number as the same decimal, exactly. */
 fun Expr<Long>.toDecimal(): Expr<BigDecimal> = unary(Wire.TO_DECIMAL, this)
