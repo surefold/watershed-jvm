@@ -3,22 +3,17 @@ package dev.surefold.watershed.cluster
 import dev.surefold.actor.ActorRef
 import dev.surefold.actor.Behaviour
 import dev.surefold.actor.Ctx
-import dev.surefold.actor.Reply
 import dev.surefold.actor.become
 import dev.surefold.actor.behaviour
-import dev.surefold.actor.remote.Codecs
-import dev.surefold.actor.remote.MessageCodec
-import dev.surefold.actor.remote.WireIn
-import dev.surefold.actor.remote.WireOut
 import dev.surefold.clock
 import dev.surefold.fail.Either
+import dev.surefold.fail.fold
 import dev.surefold.fail.left
 import dev.surefold.fail.right
 import dev.surefold.logInfo
 import kotlin.time.Instant
 import kotlin.time.toKotlinInstant
 import kotlin.time.Duration
-import kotlin.time.Duration.Companion.nanoseconds
 
 // The coordinator is one actor in the whole cluster, a singleton, on the oldest node that may run it. It tells
 // each lot of a job what to do and hears how it went. Which worker a lot is on is the cluster's business: a lot is
@@ -27,22 +22,6 @@ import kotlin.time.Duration.Companion.nanoseconds
 // It keeps nothing that cannot be had again. If its node goes, the next coordinator knows no round; whoever
 // submitted the round tells it to start again, under the same tag, and every lot that had already run answers
 // that it has, without running again.
-
-/** Start the round [request] of [job]: run [only] those lots (all, if empty), or bring them up to date with [patch]. */
-data class Start(val request: String, val job: Job, val only: List<Int>, val patch: String?, val within: Duration) : CoordinatorTurn
-
-/** How does the round [request] stand? */
-data class Progress(val request: String, val reply: Reply<Standing>) : CoordinatorTurn
-
-/** How a round stands. */
-sealed interface Standing {
-    /** This coordinator knows no such round: it has taken over from one that did, or the round was never started. */
-    data object Unknown : Standing
-
-    data class Running(val answered: Int, val lots: Int) : Standing
-
-    data class Ended(val how: Either<JobFailure, Report>) : Standing
-}
 
 // Its own timers: tell the lots not yet answered again, a lot has run too long, and the round is out of time.
 private data class TellAgain(val request: String) : CoordinatorTurn
@@ -106,11 +85,16 @@ private const val MOST_ASKED = 24
 // A lot's id among the cluster's entities. A lot given out again has another, and so, most likely, another worker.
 private fun id(job: Job, lot: Int, attempt: Int): String = "${job.id}/$lot/$attempt"
 
-internal fun coordinating(
+/**
+ * The coordinator, as the cluster's singleton runs it: it reaches a lot by its id through [lots], and counts the
+ * workers there are with [workers]. It is given both, so that a test can run it alone, with Surefold's test actors
+ * standing in for the lots and the test's own clock for its timers.
+ */
+fun coordinating(
     lots: (String) -> ActorRef<LotTurn>,
     workers: () -> Int,
     patience: Patience,
-): Behaviour<CoordinatorTurn, Table, Nothing> {
+): Behaviour<CoordinatorTurn, *, Nothing> {
     val dealer = Dealer(lots, workers, patience)
     return behaviour(Table()) { ctx, table, told -> become(dealer.turn(ctx, table, told)) }
 }
@@ -122,10 +106,9 @@ private class Dealer(private val lots: (String) -> ActorRef<LotTurn>, private va
         return when (told) {
             is Start -> start(ctx, table, told)
             is Progress -> table.also { told.reply(standing(table, told.request)) }
-            is NotUnderstood -> table.also { logInfo("coordinator: a message of kind ${told.kind} was not understood") }
             // Everything else is about one round, and means nothing once that round is over.
             is FromLot -> if (round?.start?.request == told.tag) settled(ctx, table, fromLot(ctx, round, told)) else table
-            is TellAgain -> table.also { if (round?.start?.request == told.request) round.out.forEach { (lot, out) -> tell(ctx, round, lot, out) } }
+            is TellAgain -> table.also { if (round?.start?.request == told.request) round.out.forEach { (lot, out) -> tell(round, lot, out) } }
             is Late -> if (round?.start?.request == told.request) settled(ctx, table, late(ctx, round, told)) else table
             is OutOfTime ->
                 if (round?.start?.request == told.request) {
@@ -140,7 +123,7 @@ private class Dealer(private val lots: (String) -> ActorRef<LotTurn>, private va
 
     private fun standing(table: Table, request: String): Standing = when {
         table.round?.start?.request == request -> table.round.standing()
-        else -> table.ended[request]?.let { Standing.Ended(it) } ?: Standing.Unknown
+        else -> table.ended[request]?.fold({ Standing.Stopped(it) }, { Standing.Done(it) }) ?: Standing.Unknown
     }
 
     private fun start(ctx: Ctx<CoordinatorTurn>, table: Table, told: Start): Table {
@@ -161,26 +144,26 @@ private class Dealer(private val lots: (String) -> ActorRef<LotTurn>, private va
                 val round = Round(told, clock.get().now().toKotlinInstant(), wanted.size, out)
                 ctx.timers.every("again", patience.tellAgainEvery, TellAgain(told.request))
                 ctx.timers.after("round", told.within, OutOfTime(told.request))
-                out.forEach { (lot, to) -> tell(ctx, round, lot, to) }
+                out.forEach { (lot, to) -> tell(round, lot, to) }
                 table.copy(round = round)
             }
         }
     }
 
     // Tells a lot what is wanted of it now: where its id would put it, or, once it is placed, to get on with it.
-    private fun tell(ctx: Ctx<CoordinatorTurn>, round: Round, lot: Int, out: Out) {
+    private fun tell(round: Round, lot: Int, out: Out) {
         val job = round.job
         val patch = round.start.patch
         val id = out.id
         lots(id).tell(
             if (!out.placed) {
-                Where(id, round.start.request, lot, ctx.self)
+                Where(id, round.start.request, lot)
             } else if (patch != null) {
-                BringUpToDate(id, round.start.request, lot, patch, job.answers(lot), job.columns, ctx.self)
+                BringUpToDate(id, round.start.request, lot, patch, job.answers(lot), job.columns)
             } else {
                 Run(
                     id, round.start.request, lot, job.plan, job.inputs, job.first(lot), job.count(lot), job.answers(lot),
-                    job.columns, job.hold, ctx.self,
+                    job.columns, job.hold,
                 )
             },
         )
@@ -189,7 +172,6 @@ private class Dealer(private val lots: (String) -> ActorRef<LotTurn>, private va
     private fun fromLot(ctx: Ctx<CoordinatorTurn>, round: Round, told: FromLot): Either<JobFailure, Round> {
         val out = round.out[told.lot]
         return when (told) {
-            is NotUnderstood -> round.right()
             // Heard from where it is now: any clock on where it was no longer counts.
             is At -> (if (out == null || out.placed || out.id != told.id) round else placing(ctx, round, told.lot, out, told.worker)).right()
             is Queued -> round.heard(ctx, told.lot) { it.copy(worker = told.worker, begun = false) }.right()
@@ -254,7 +236,7 @@ private class Dealer(private val lots: (String) -> ActorRef<LotTurn>, private va
     // Gives a lot out again: it is placed afresh, under another id, on a worker it has not failed on.
     private fun again(ctx: Ctx<CoordinatorTurn>, round: Round, lot: Int, out: Out): Round {
         val next = Out(id(round.job, lot, out.attempt + 1), out.attempt + 1, avoid = out.avoid)
-        tell(ctx, round, lot, next)
+        tell(round, lot, next)
         return round.copy(out = round.out + (lot to next), givenAgain = round.givenAgain + 1)
     }
 
@@ -272,7 +254,7 @@ private class Dealer(private val lots: (String) -> ActorRef<LotTurn>, private va
         } else {
             out.copy(id = id(round.job, lot, out.attempt + 1), attempt = out.attempt + 1, asked = out.asked + 1)
         }
-        tell(ctx, round, lot, next)
+        tell(round, lot, next)
         return round.copy(out = round.out + (lot to next))
     }
 
@@ -307,139 +289,4 @@ private class Dealer(private val lots: (String) -> ActorRef<LotTurn>, private va
 
     private fun remembered(table: Table, request: String, how: Either<JobFailure, Report>): Table =
         table.copy(ended = (table.ended + (request to how)).entries.toList().takeLast(REMEMBERED).associate { it.key to it.value })
-}
-
-// ------------------------------------------------------------------ codecs
-
-/** How what is told to the coordinator from another node crosses. Its own timers never cross, and have no encoding. */
-object CoordinatorCodec : MessageCodec<CoordinatorTurn> {
-    private val ints = Codecs.list(Codecs.int)
-
-    override fun write(message: CoordinatorTurn, out: WireOut) = when (message) {
-        is Start -> {
-            out.int(1)
-            out.string(message.request)
-            val job = message.job
-            out.string(job.id)
-            out.string(job.plan)
-            out.string(job.inputs)
-            out.long(job.scenarios)
-            out.int(job.lot)
-            out.string(job.out)
-            ints.write(job.columns, out)
-            out.boolean(job.hold)
-            ints.write(message.only, out)
-            out.nullable(message.patch, out::string)
-            out.long(message.within.inWholeNanoseconds)
-        }
-
-        is Progress -> {
-            out.int(2)
-            out.string(message.request)
-            out.reply(message.reply, StandingCodec)
-        }
-
-        else -> out.int(0)
-    }
-
-    override fun read(input: WireIn): CoordinatorTurn = when (val kind = input.int()) {
-        1 -> {
-            val request = input.string()
-            val job = Job(
-                input.string(), input.string(), input.string(), input.long(), input.int(), input.string(),
-                ints.read(input), input.boolean(),
-            )
-            Start(request, job, ints.read(input), input.nullable(input::string), input.long().nanoseconds)
-        }
-
-        2 -> Progress(input.string(), input.reply(StandingCodec))
-        else -> NotUnderstood(kind)
-    }
-}
-
-object StandingCodec : MessageCodec<Standing> {
-    private val ints = Codecs.list(Codecs.int)
-    private val strings = Codecs.list(Codecs.string)
-
-    override fun write(message: Standing, out: WireOut) = when (message) {
-        Standing.Unknown -> out.int(0)
-        is Standing.Running -> {
-            out.int(1)
-            out.int(message.answered)
-            out.int(message.lots)
-        }
-
-        is Standing.Ended -> when (val how = message.how) {
-            is Either.Right -> {
-                out.int(2)
-                val report = how.value
-                out.int(report.lots.size)
-                report.lots.forEach {
-                    out.int(it.lot)
-                    out.string(it.worker)
-                    out.string(it.on)
-                    out.double(it.loadSeconds)
-                    out.double(it.runSeconds)
-                }
-                out.int(report.givenAgain)
-                strings.write(report.failures, out)
-                out.long(report.took.inWholeNanoseconds)
-                ints.write(report.lost, out)
-            }
-
-            is Either.Left -> {
-                out.int(3)
-                failure(how.value, out)
-            }
-        }
-    }
-
-    override fun read(input: WireIn): Standing = when (input.int()) {
-        1 -> Standing.Running(input.int(), input.int())
-        2 -> Standing.Ended(
-            Report(
-                List(input.int()) { LotRun(input.int(), input.string(), input.string(), input.double(), input.double()) },
-                input.int(), strings.read(input), input.long().nanoseconds, ints.read(input),
-            ).right(),
-        )
-
-        3 -> Standing.Ended(failure(input).left())
-        else -> Standing.Unknown
-    }
-
-    private fun failure(failure: JobFailure, out: WireOut) = when (failure) {
-        is JobFailure.NotAJob -> out.int(1).also { out.string(failure.why) }
-        is JobFailure.File -> out.int(2).also { out.string(failure.key) }.also { out.string(failure.why) }
-        is JobFailure.Busy -> out.int(3).also { out.string(failure.running) }
-        is JobFailure.NoSuchLots -> out.int(4).also { ints.write(failure.asked, out) }.also { out.int(failure.lots) }
-        is JobFailure.NotHeld -> out.int(5).also { out.string(failure.job) }
-        is JobFailure.LotKeptFailing -> {
-            out.int(6)
-            out.int(failure.lot)
-            out.int(failure.times)
-            out.string(failure.worker)
-            out.string(failure.why)
-        }
-
-        is JobFailure.OutOfTime -> {
-            out.int(7)
-            out.int(failure.answered)
-            out.int(failure.lots)
-            out.long(failure.within.inWholeNanoseconds)
-        }
-
-        is JobFailure.NoAnswer -> out.int(8).also { out.string(failure.why) }
-    }
-
-    private fun failure(input: WireIn): JobFailure = when (val kind = input.int()) {
-        1 -> JobFailure.NotAJob(input.string())
-        2 -> JobFailure.File(input.string(), input.string())
-        3 -> JobFailure.Busy(input.string())
-        4 -> JobFailure.NoSuchLots(ints.read(input), input.int())
-        5 -> JobFailure.NotHeld(input.string())
-        6 -> JobFailure.LotKeptFailing(input.int(), input.int(), input.string(), input.string())
-        7 -> JobFailure.OutOfTime(input.int(), input.int(), input.long().nanoseconds)
-        8 -> JobFailure.NoAnswer(input.string())
-        else -> JobFailure.NoAnswer("a failure of kind $kind this node does not know")
-    }
 }

@@ -227,6 +227,13 @@ val report: Either<JobFailure, Report> = attempt {
 Nothing in it throws: a bad job, a file that cannot be read, a lot that keeps
 failing and a run out of time are each a case of `JobFailure`.
 
+What crosses between nodes is plain data: `@Serializable` classes written by
+Surefold's `Kotlinx` codecs, with no codec written by hand. A lot answers the
+coordinator by its name in the cluster, so its answer reaches whichever node
+runs the coordinator now. The coordinator's own logic, how it places lots,
+gives one out again and ends a round, is tested alone on Surefold's test
+actors, with no nodes started and the test moving the clock.
+
 A lot whose worker stops is run by another once the cluster has given up on
 that worker. A lot that runs longer than it is allowed, on a worker that has
 hung but not stopped, is given out again under another id, with every lot

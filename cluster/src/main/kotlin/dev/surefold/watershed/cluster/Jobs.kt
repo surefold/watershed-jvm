@@ -1,10 +1,12 @@
 package dev.surefold.watershed.cluster
 
+import dev.surefold.Promise
 import dev.surefold.Schedule
 import dev.surefold.Scope
 import dev.surefold.Shared
 import dev.surefold.actor.ActorRef
 import dev.surefold.actor.ask
+import dev.surefold.awaitValue
 import dev.surefold.actor.become
 import dev.surefold.actor.behaviour
 import dev.surefold.actor.remote.Node
@@ -33,6 +35,7 @@ import dev.surefold.watershed.Gpu
 import dev.surefold.watershed.Refused
 import kotlin.time.Instant
 import kotlin.time.toKotlinInstant
+import kotlinx.serialization.Serializable
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.days
 import kotlin.time.Duration.Companion.minutes
@@ -43,6 +46,7 @@ import kotlin.time.Duration.Companion.seconds
  * of them to a lot, and a prefix, [out], that each lot's answers are written under. Each names a file in the
  * bucket every node reaches. [Job.read] makes one from the scenarios' file itself.
  */
+@Serializable
 data class Job(
     val id: String,
     val plan: String,
@@ -91,17 +95,20 @@ data class Job(
 }
 
 /** One lot as it was run, for a report. */
+@Serializable
 data class LotRun(val lot: Int, val worker: String, val on: String, val loadSeconds: Double, val runSeconds: Double)
 
 /**
  * How a job or a refresh went: who ran each lot, how many lots were given out again, why any lot failed on a
  * worker, and how long it all took.
  */
+@Serializable
 data class Report(
-    val lots: List<LotRun>,
-    val givenAgain: Int,
-    val failures: List<String>,
-    val took: Duration,
+    // Each list has a default because an empty one is not written at all when it crosses.
+    val lots: List<LotRun> = emptyList(),
+    val givenAgain: Int = 0,
+    val failures: List<String> = emptyList(),
+    val took: Duration = Duration.ZERO,
     /**
      * After [Jobs.refresh]: the lots that could not be brought up to date, because the worker that held them has
      * gone. Their answers are as they were; run them again with [Jobs.run] and a plan made after the change.
@@ -153,15 +160,20 @@ class Patience(
 fun Scope<*>.jobs(cluster: Cluster, store: Store, working: Working? = null, patience: Patience = Patience()): Either<NoGpu, Jobs> =
     (if (working == null) card(false) else card(working.gpu)).map { card ->
         val self = cluster.self.toString()
+        // A lot answers the coordinator by its name in the cluster, so its answer reaches whichever node runs the
+        // coordinator now. The lots are made before the coordinator is, so they are handed the way to it once it is.
+        val reached = Promise<Nothing, ActorRef<CoordinatorTurn>>("watershed-coordinator")
+        val toCoordinator: (FromLot) -> Unit = { reached.awaitValue().tell(it) }
         // Every node has a bench, since every node makes the same sharding; only a worker's is ever given a lot.
-        val bench = spawn("bench", bench(Rig(self, store, card, working?.gpuBytes, working?.beforeRun ?: {})))
+        val bench = spawn("bench", bench(Rig(self, store, card, working?.gpuBytes, working?.beforeRun ?: {}, toCoordinator)))
         // A lot holds what it ran in memory, so it is never put to sleep for being idle.
-        val lots = cluster.sharding("watershed-lot", LotCodec, passivateAfter = 3650.days, role = WORKER) { _ -> lot(self, bench) }
+        val lots = cluster.sharding("watershed-lot", LotCodec, passivateAfter = 3650.days, role = WORKER) { _ -> lot(self, bench, toCoordinator) }
         val workers = Shared(Workers(0, now()), "watershed-workers")
         cluster.subscribe(spawn("workers", counting(cluster, workers)))
         val coordinator = cluster.singleton("watershed-coordinator", CoordinatorCodec, role = COORDINATOR) {
             coordinating({ id -> lots.entity(id) }, { workers.peek().count }, patience)
         }
+        reached.succeed(coordinator)
         Jobs(coordinator, store, workers, self, patience)
     }
 
@@ -261,7 +273,11 @@ class Jobs internal constructor(
         val standing = coordinator.ask<CoordinatorTurn, Standing>(10.seconds) { Progress(start.request, it) }.fold({ null }, { it })
         // A coordinator that does not know the round has only just taken over from the one that did.
         if (standing == Standing.Unknown) coordinator.tell(start)
-        return if (standing is Standing.Ended) standing.how else fail(Waiting)
+        return when (standing) {
+            is Standing.Done -> standing.report.right()
+            is Standing.Stopped -> standing.why.left()
+            else -> fail(Waiting)
+        }
     }
 }
 
