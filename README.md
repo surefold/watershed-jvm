@@ -302,6 +302,13 @@ were the same, to the last bit, as one run in one process.
 | A held run on two GPU workers | 28.5 s, 10 s of it each worker fetching the plan |
 | That run brought up to date after one policy changes | 0.33 s |
 
+A plan made in clusters (the engine's `WATERSHED_CLUSTERS`, experimental)
+is saved with them, and workers that fetch it run it so. Two GPU workers,
+four lots, two runs of each: 25.1 s and 25.4 s with the plain plan, 27.0 s
+and 23.4 s with the clustered one, the same answers. So nothing gained in a
+single run: the clustered plan is a bigger file (2.4 GB against 2.0 GB) and
+each worker compiles its kernels once before its first lot.
+
 Workers that share one card take turns on it, so more of them is no faster
 here: this shows that the answers are right and what the cluster costs, not
 a speed-up. **It has not been run on more than one machine, or on more than

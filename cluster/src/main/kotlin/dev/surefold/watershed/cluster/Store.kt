@@ -39,17 +39,7 @@ class Store(private val files: Files) {
 
     /** Puts a plan or a patch the engine [saved] at [key], a part at a time. */
     fun put(key: String, saved: Saved): Either<JobFailure.File, Unit> = attempt {
-        if (saved.size <= PART) {
-            val bytes = engine(key) { saved.read(0, saved.size.toInt()) }
-            bucket(key) { at -> files.put(at, bytes.inputStream(), bytes.size.toLong(), BYTES).bind() }.bind()
-        } else {
-            val upload = bucket(key) { at -> files.multipart(at, BYTES).bind() }.bind()
-            (0 until saved.size step PART).forEachIndexed { part, from ->
-                val bytes = engine(key) { saved.read(from, minOf(PART, saved.size - from).toInt()) }
-                bucket(key) { upload.part(part + 1, bytes.inputStream(), bytes.size.toLong()).bind() }.bind()
-            }
-            bucket(key) { upload.complete().bind() }.bind()
-        }
+        sent(key, saved.size) { from, count -> attempt { engine(key) { saved.read(from, count) } } }
     }
 
     /** The plan or patch at [key], as bytes in the engine, for `Plan.from` or `Patch.from` to read. */
@@ -65,7 +55,26 @@ class Store(private val files: Files) {
     fun upload(from: String, key: String): Either<JobFailure.File, Unit> = attempt {
         val size = disk(key) { Path(from).fileSize() }.bind()
         val stream = disk(key) { Path(from).inputStream() }.bind()
-        bucket(key) { at -> stream.use { files.put(at, it, size, BYTES).bind() } }.bind()
+        // Read in order, so each part is what comes next in the file.
+        stream.use { sent(key, size) { _, count -> disk(key) { it.readNBytes(count) } } }
+    }
+
+    // Puts [size] bytes at [key], [part] giving those from a place on: in one go if small, and a part at a time
+    // otherwise, so that no one call on the bucket has more to send than its time allows.
+    context(_: Fail<JobFailure.File>)
+    private fun sent(key: String, size: Long, part: (Long, Int) -> Either<JobFailure.File, ByteArray>) {
+        if (size <= PART) {
+            val bytes = part(0, size.toInt()).bind()
+            bucket(key) { at -> files.put(at, bytes.inputStream(), bytes.size.toLong(), BYTES).bind() }.bind()
+        } else {
+            val upload = bucket(key) { at -> files.multipart(at, BYTES).bind() }.bind()
+            (0 until size step PART).forEachIndexed { number, from ->
+                val bytes = part(from, minOf(PART, size - from).toInt()).bind()
+                ensure(bytes.size.toLong() == minOf(PART, size - from)) { JobFailure.File(key, "it ended after ${from + bytes.size} of $size bytes") }
+                bucket(key) { upload.part(number + 1, bytes.inputStream(), bytes.size.toLong()).bind() }.bind()
+            }
+            bucket(key) { upload.complete().bind() }.bind()
+        }
     }
 
     // Reads what is left of a file into [saved], a part at a time; a file that ends early, or goes on, is not the one asked for.

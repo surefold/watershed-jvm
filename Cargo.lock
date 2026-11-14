@@ -112,7 +112,7 @@ dependencies = [
 [[package]]
 name = "watershed-core"
 version = "0.1.0"
-source = "git+https://github.com/surefold/watershed?rev=0dc28134abf803943e4a86c8e6429a366049f8ae#0dc28134abf803943e4a86c8e6429a366049f8ae"
+source = "git+https://github.com/surefold/watershed?rev=47f37ca0a8d053680715151fa94f87e2f5152b3b#47f37ca0a8d053680715151fa94f87e2f5152b3b"
 dependencies = [
  "rayon",
  "rust_decimal",
@@ -121,7 +121,7 @@ dependencies = [
 [[package]]
 name = "watershed-gpu"
 version = "0.1.0"
-source = "git+https://github.com/surefold/watershed?rev=0dc28134abf803943e4a86c8e6429a366049f8ae#0dc28134abf803943e4a86c8e6429a366049f8ae"
+source = "git+https://github.com/surefold/watershed?rev=47f37ca0a8d053680715151fa94f87e2f5152b3b#47f37ca0a8d053680715151fa94f87e2f5152b3b"
 dependencies = [
  "cudarc",
  "rayon",
