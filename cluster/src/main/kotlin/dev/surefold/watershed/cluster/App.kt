@@ -204,7 +204,7 @@ fun main(args: Array<String>) {
         "worker" -> runApp(Worker).code
         "submit" -> runApp(Submit).code.takeIf { it != 0 } ?: if (Submit.failed.peek()) 1 else 0
         "put" -> runApp(Put).code.takeIf { it != 0 } ?: if (Put.failed.peek()) 1 else 0
-        else -> 2.also { logError("say worker, submit or put; every setting is in reference.conf, and is given with -Dwatershed.…=") }
+        else -> 2.also { logError("say worker, submit or put; every setting is in reference.conf, and is given as -Dwatershed.SETTING=VALUE") }
     }
     exitProcess(code)
 }
