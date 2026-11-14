@@ -404,6 +404,7 @@ private class Dealer(
                 .with(round.answered(LotRun(told.lot, told.worker, told.on, told.loadSeconds, told.runSeconds)))
 
             is Failed -> failed(ctx, freed(ctx, table, at, hand, told.lot), round, told)
+            is NotUnderstood -> table
         }
     }
 
@@ -489,7 +490,7 @@ private class Dealer(
         return table.with(at, hand.copy(doing = Doing.Offered(lot))).with(round.out(at))
     }
 
-    private fun offer(ctx: Ctx<CoordinatorTurn>, round: Round, lot: Int): ToWorker {
+    private fun offer(ctx: Ctx<CoordinatorTurn>, round: Round, lot: Int): Lot {
         val job = round.job
         val answers = job.answers(lot).toString()
         return if (round.patch != null) {

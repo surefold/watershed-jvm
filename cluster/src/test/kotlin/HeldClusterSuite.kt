@@ -99,7 +99,7 @@ private fun withLedger(test: (Ledger) -> Unit) = withTempDirectory("watershed-he
  * that runs 1,000 scenarios of it to be held. Each test has its own, since changing a floor changes the graph.
  */
 private class Ledger(private val folder: Path) {
-    private val g = Graph()
+    private val g = engine { Graph() }
     private val rate = engine { g.input("rate", 0.01) }
     private val shock = engine { g.input("shock", 0.0) }
     private val floors: List<Input<Double>> = engine { (0 until 20).map { n -> g.input("floor$n", 90.0 + n) } }

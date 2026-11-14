@@ -116,8 +116,23 @@ it a `Refused` with the reason, as is anything else the engine will not do.
 A scope costs nothing when nothing is refused: a set is 15 ns and a read
 10 ns in a loop of twenty million, the same as before the scope was there.
 
-In Scala a refusal is thrown as a `WatershedException`, and `g.get(node)`
-gives `None` for a node that could not be calculated.
+Scala is the same, with a `using` clause where Kotlin has a context:
+
+```scala
+val total: Either[Refused, Double] = attempt:
+  val g = Graph()
+  val qty = g.input("qty", 10.0)
+  val price = g.input("price", 2.5)
+  g(g.define("total", qty * price))
+
+def reprice(g: Graph, price: Input[Double], to: Double)(using Refusing): Unit =
+  g(price) = to
+  g.stabilize()
+```
+
+Neither layer has a `throw`, a `try` or a `var` in it. A library that cannot
+be found, or was built from another version of the engine, is a `Refused`
+from the first call, not an error at startup.
 
 ## How fast
 

@@ -18,6 +18,7 @@ import dev.surefold.fail.fold
 import dev.surefold.fail.map
 import dev.surefold.fail.mapLeft
 import dev.surefold.fail.right
+import dev.surefold.logInfo
 import dev.surefold.watershed.Gpu
 import dev.surefold.watershed.Held
 import dev.surefold.watershed.Patch
@@ -66,7 +67,9 @@ fun Scope<*>.worker(
                     become(seated.copy(busy = false, held = seated.held + listOfNotNull(told.holds)))
                 }
 
-                is ToWorker -> {
+                is NotUnderstood -> stay().also { logInfo("worker: a message of kind ${told.kind} was not understood") }
+
+                is Lot -> {
                     val taking = when {
                         told is Refresh && told.job to told.lot !in desk.held -> Taking.NotHeld
                         desk.busy -> Taking.Busy
@@ -90,7 +93,7 @@ private fun card(gpu: Boolean?): Either<NoGpu, Gpu?> = when (gpu) {
 }
 
 // What the worker's actor gives its bench to do, and what the bench tells it back.
-private data class Work(val told: ToWorker, val back: ActorRef<WorkerTurn>)
+private data class Work(val told: Lot, val back: ActorRef<WorkerTurn>)
 
 private data class Finished(val outcome: FromWorker, val from: ActorRef<FromWorker>, val holds: Pair<String, Int>?) : WorkerTurn
 

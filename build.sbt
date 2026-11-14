@@ -126,6 +126,7 @@ lazy val exampleScala = (project in file("examples/scala"))
   .settings(jdk, native)
   .settings(
     name := "watershed-example-scala",
+    libraryDependencies += "dev.surefold" % "surefold" % surefold,
     scalacOptions ++= Seq("-deprecation", "-feature", "-Werror"),
     publish / skip := true,
   )

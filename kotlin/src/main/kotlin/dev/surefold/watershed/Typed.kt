@@ -94,9 +94,17 @@ fun <T : Any> value(value: T): Expr<T> = constant(if (value is Int) value.toLong
 // ------------------------------------------------------------------- graph
 
 /** A graph of inputs and calculated nodes. */
-class Graph {
-    // Where the graph is in the engine. It is freed when this object can no longer be reached.
-    private val address: Long = Native.graph(this)
+class Graph private constructor(private val address: Long) {
+    init {
+        // Freed in the engine when this object can no longer be reached.
+        Native.ownGraph(this, address)
+    }
+
+    companion object {
+        /** A new, empty graph: `Graph()`. Refused if the engine's library cannot be found. */
+        context(_: Fail<Refused>)
+        operator fun invoke(): Graph = Graph(Native.graph())
+    }
 
     context(_: Fail<Refused>)
     private fun <N : Node<*>> mine(node: N): N {

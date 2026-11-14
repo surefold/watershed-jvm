@@ -15,11 +15,21 @@ const val WORKER_PATH = "/user/worker"
 /** What a worker's actor handles: what it is told from elsewhere, and what it tells itself. */
 sealed interface WorkerTurn
 
-/** What a worker is told. Each carries a [tag], which the worker's answers carry back, and who to answer. */
-sealed interface ToWorker : WorkerTurn {
+/** What a worker is told. */
+sealed interface ToWorker : WorkerTurn
+
+/** A lot to do something with. It carries a [tag], which the worker's answers carry back, and who to answer. */
+sealed interface Lot : ToWorker {
     val tag: String
     val lot: Int
     val from: ActorRef<FromWorker>
+}
+
+/** A message of a [kind] this node does not know: one from a newer version. It is noted, and nothing is done. */
+data class NotUnderstood(val kind: Int) : ToWorker, FromWorker {
+    override val tag: String get() = ""
+    override val lot: Int get() = -1
+    override val worker: String get() = ""
 }
 
 /**
@@ -41,7 +51,7 @@ data class Assign(
     /** Whether the worker is to hold on to the lot's inputs and every output, to be brought up to date later. */
     val hold: Boolean,
     override val from: ActorRef<FromWorker>,
-) : ToWorker
+) : Lot
 
 /** A lot the worker holds, to be brought up to date with the patch at [patch], and its [columns] written again. */
 data class Refresh(
@@ -52,7 +62,7 @@ data class Refresh(
     val answers: String,
     val columns: List<Int>,
     override val from: ActorRef<FromWorker>,
-) : ToWorker
+) : Lot
 
 /** What the coordinator's actor handles: what workers tell it, and what this node tells it. */
 sealed interface CoordinatorTurn
@@ -89,6 +99,7 @@ object FromWorkerCodec : MessageCodec<FromWorker> {
                 is Answer -> 1
                 is Ran -> 2
                 is Failed -> 3
+                is NotUnderstood -> message.kind
             },
         )
         out.string(message.tag)
@@ -103,6 +114,7 @@ object FromWorkerCodec : MessageCodec<FromWorker> {
             }
 
             is Failed -> out.string(message.why)
+            is NotUnderstood -> Unit
         }
     }
 
@@ -112,11 +124,10 @@ object FromWorkerCodec : MessageCodec<FromWorker> {
         val lot = input.int()
         val worker = input.string()
         return when (kind) {
-            1 -> Answer(tag, lot, worker, Taking.entries[input.int()])
+            1 -> input.int().let { taking -> Taking.entries.getOrNull(taking)?.let { Answer(tag, lot, worker, it) } ?: NotUnderstood(kind) }
             2 -> Ran(tag, lot, worker, input.string(), input.double(), input.double())
             3 -> Failed(tag, lot, worker, input.string())
-            // A codec's read can only answer a message or throw, as Surefold's own do for a tag they do not know.
-            else -> error("no message from a worker has the tag $kind")
+            else -> NotUnderstood(kind)
         }
     }
 }
@@ -150,6 +161,8 @@ object ToWorkerCodec : MessageCodec<ToWorker> {
             columns.write(message.columns, out)
             out.ref(message.from, FromWorkerCodec)
         }
+
+        is NotUnderstood -> out.int(message.kind)
     }
 
     override fun read(input: WireIn): ToWorker = when (val kind = input.int()) {
@@ -163,7 +176,6 @@ object ToWorkerCodec : MessageCodec<ToWorker> {
             input.ref(FromWorkerCodec),
         )
 
-        // As above: a codec's read answers a message or throws.
-        else -> error("no message to a worker has the tag $kind")
+        else -> NotUnderstood(kind)
     }
 }
