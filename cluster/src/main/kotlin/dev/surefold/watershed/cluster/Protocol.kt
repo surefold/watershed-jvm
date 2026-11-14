@@ -12,19 +12,25 @@ const val WORKER = "worker"
 /** Where every worker's actor is, on its node. */
 const val WORKER_PATH = "/user/worker"
 
+/** What a worker's actor handles: what it is told from elsewhere, and what it tells itself. */
+sealed interface WorkerTurn
+
+/** What a worker is told. Each carries a [tag], which the worker's answers carry back, and who to answer. */
+sealed interface ToWorker : WorkerTurn {
+    val tag: String
+    val lot: Int
+    val from: ActorRef<FromWorker>
+}
+
 /**
  * One lot of a job's scenarios, for a worker to run: scenarios [first] to [first] + [count] of the file at
  * [inputs], with the plan at [plan], their answers to be written to [answers]. The files are named, not sent: a
  * plan is too big to cross as a message, so every node must be able to read and write the same folder.
- *
- * The worker tells [from] an [Answer] at once, that it took the lot or is busy, and an [Outcome] when the lot has
- * been run or has failed.
  */
 data class Assign(
     val job: String,
-    /** What its answer and outcome are to carry, to tell one run of a job from another. */
-    val tag: String,
-    val lot: Int,
+    override val tag: String,
+    override val lot: Int,
     val plan: String,
     val inputs: String,
     val first: Long,
@@ -34,91 +40,84 @@ data class Assign(
     val columns: List<Int>,
     /** Whether the worker is to hold on to the lot's inputs and every output, to be brought up to date later. */
     val hold: Boolean,
-    val from: ActorRef<FromWorker>,
+    override val from: ActorRef<FromWorker>,
 ) : ToWorker
 
-/**
- * A lot the worker holds, to be brought up to date with the patch in the file at [patch], and its [columns]
- * written to [answers] again. It is answered as a lot to run is, or with [NOT_HELD].
- */
+/** A lot the worker holds, to be brought up to date with the patch at [patch], and its [columns] written again. */
 data class Refresh(
     val job: String,
-    /** What its answer and outcome are to carry, to tell one refresh from another. */
-    val tag: String,
-    val lot: Int,
+    override val tag: String,
+    override val lot: Int,
     val patch: String,
     val answers: String,
     val columns: List<Int>,
-    val from: ActorRef<FromWorker>,
+    override val from: ActorRef<FromWorker>,
 ) : ToWorker
-
-/** What a worker's actor handles: what it is told from elsewhere, and what it tells itself. */
-sealed interface WorkerTurn
-
-/** What a worker is told. */
-sealed interface ToWorker : WorkerTurn
 
 /** What the coordinator's actor handles: what workers tell it, and what this node tells it. */
 sealed interface CoordinatorTurn
 
 /** What a worker tells whoever gave it something to do. */
-sealed interface FromWorker : CoordinatorTurn
+sealed interface FromWorker : CoordinatorTurn {
+    val tag: String
+    val lot: Int
+    val worker: String
+}
 
-/** A worker's answer, at once, to being given [lot]: [BUSY], [TAKEN] or [NOT_HELD]. */
-data class Answer(val tag: String, val lot: Int, val worker: String, val answer: Int) : FromWorker
+/** What a worker says, at once, to being given a lot. */
+enum class Taking { Taken, Busy, NotHeld }
 
-/** A worker's answers to being given something to do: it is busy, it has taken it, or it does not hold the lot. */
-const val BUSY = 0
-const val TAKEN = 1
-const val NOT_HELD = 2
+data class Answer(override val tag: String, override val lot: Int, override val worker: String, val taking: Taking) : FromWorker
 
-/** What became of a lot: [failed] is why it could not be run, or null when its answers are written. */
-data class Outcome(
-    val tag: String,
-    val lot: Int,
-    val worker: String,
-    val failed: String?,
+/** A lot's answers are written. It ran [on] the worker's `gpu` or `cpu`. */
+data class Ran(
+    override val tag: String,
+    override val lot: Int,
+    override val worker: String,
+    val on: String,
     val loadSeconds: Double,
     val runSeconds: Double,
-    val on: String,
 ) : FromWorker
 
-object FromWorkerCodec : MessageCodec<FromWorker> {
-    override fun write(message: FromWorker, out: WireOut) = when (message) {
-        is Answer -> {
-            out.int(1)
-            out.string(message.tag)
-            out.int(message.lot)
-            out.string(message.worker)
-            out.int(message.answer)
-        }
+/** A lot could not be run, and [why]. */
+data class Failed(override val tag: String, override val lot: Int, override val worker: String, val why: String) : FromWorker
 
-        is Outcome -> {
-            out.int(2)
-            out.string(message.tag)
-            out.int(message.lot)
-            out.string(message.worker)
-            out.nullable(message.failed, out::string)
-            out.double(message.loadSeconds)
-            out.double(message.runSeconds)
-            out.string(message.on)
+object FromWorkerCodec : MessageCodec<FromWorker> {
+    override fun write(message: FromWorker, out: WireOut) {
+        out.int(
+            when (message) {
+                is Answer -> 1
+                is Ran -> 2
+                is Failed -> 3
+            },
+        )
+        out.string(message.tag)
+        out.int(message.lot)
+        out.string(message.worker)
+        when (message) {
+            is Answer -> out.int(message.taking.ordinal)
+            is Ran -> {
+                out.string(message.on)
+                out.double(message.loadSeconds)
+                out.double(message.runSeconds)
+            }
+
+            is Failed -> out.string(message.why)
         }
     }
 
-    override fun read(input: WireIn): FromWorker = when (val tag = input.int()) {
-        1 -> Answer(input.string(), input.int(), input.string(), input.int())
-
-        2 -> Outcome(
-            input.string(),
-            input.int(),
-            input.string(),
-            input.nullable(input::string),
-            input.double(),
-            input.double(),
-            input.string(),
-        )
-
-        else -> error("no message from a worker has the tag $tag")
+    override fun read(input: WireIn): FromWorker {
+        val kind = input.int()
+        val tag = input.string()
+        val lot = input.int()
+        val worker = input.string()
+        return when (kind) {
+            1 -> Answer(tag, lot, worker, Taking.entries[input.int()])
+            2 -> Ran(tag, lot, worker, input.string(), input.double(), input.double())
+            3 -> Failed(tag, lot, worker, input.string())
+            // A codec's read can only answer a message or throw, as Surefold's own do for a tag they do not know.
+            else -> error("no message from a worker has the tag $kind")
+        }
     }
 }
 
@@ -153,7 +152,7 @@ object ToWorkerCodec : MessageCodec<ToWorker> {
         }
     }
 
-    override fun read(input: WireIn): ToWorker = when (val tag = input.int()) {
+    override fun read(input: WireIn): ToWorker = when (val kind = input.int()) {
         1 -> Assign(
             input.string(), input.string(), input.int(), input.string(), input.string(), input.long(), input.int(),
             input.string(), columns.read(input), input.boolean(), input.ref(FromWorkerCodec),
@@ -164,6 +163,7 @@ object ToWorkerCodec : MessageCodec<ToWorker> {
             input.ref(FromWorkerCodec),
         )
 
-        else -> error("no message to a worker has the tag $tag")
+        // As above: a codec's read answers a message or throws.
+        else -> error("no message to a worker has the tag $kind")
     }
 }

@@ -102,7 +102,8 @@ lazy val cluster = (project in file("cluster"))
     kotlincJvmTarget := "25",
     libraryDependencies ++= Seq(
       "dev.surefold" % "surefold-cluster" % "0.18.1",
-      "org.jetbrains.kotlin" % "kotlin-test-junit5" % kotlin % Test,
+      // The tests are surefold-junit suites: each an object, found by Surefold's own JUnit Platform engine.
+      "dev.surefold" % "surefold-junit" % "0.18.1" % Test,
       "com.github.sbt.junit" % "jupiter-interface" % "0.19.0" % Test,
     ),
   )

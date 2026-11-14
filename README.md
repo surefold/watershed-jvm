@@ -164,13 +164,20 @@ is a shared volume.
 // On each worker:
 val node = node("worker-1", 25520, host = "10.0.0.8")
 val cluster = cluster(node, Discovery.static("10.0.0.7:25520"), roles = setOf(WORKER), ready = Ready.WhenTold)
-worker(node)
+worker(node)                     // Either<NoGpu, Unit>
 cluster.admit()
 
 // On the coordinator:
 val coordinator = coordinator(node, cluster)
-val report = coordinator.run(Job("book", plan, scenarios, inputsPerScenario = 240, lot = 1_250, out = folder))
+val report: Either<JobFailure, Report> = attempt {
+    val job = Job.read("book", plan, scenarios, inputsPerScenario = 240, lot = 1_250, out = folder).bind()
+    coordinator.run(job).bind()
+}
 ```
+
+Nothing in the cluster module throws for a job that cannot be finished: a
+bad job, a file that cannot be read, a lot that keeps failing and a run out
+of time are each a case of `JobFailure`, on the left of an `Either`.
 
 `cluster/run-local.sh` starts a coordinator and workers as separate processes
 on one machine, and `cluster/image.sh` builds one container image for every
@@ -208,13 +215,13 @@ holds and write their answers again. Nothing is run again but that.
 ```kotlin
 val kept = g.kept(vary = paths, outputs = totals, keep = groupSums)
 kept.plan.save(planFile)
-val job = Job("book", planFile, scenarios, 240, 1_250, folder, columns = kept.outputColumns.toList(), hold = true)
-coordinator.run(job)
+val job = Job.read("book", planFile, scenarios, 240, 1_250, folder, columns = kept.outputColumns.toList(), hold = true).bind()
+coordinator.run(job).bind()
 
 g[promised] = 1.1 * was          // one policy changes
 g.stabilize()
-kept.patch(listOf(promised))!!.save(patchFile)
-val report = coordinator.refresh(job, patchFile)   // report.lost: lots whose worker has gone
+kept.patch(listOf(promised))?.save(patchFile)
+val report = coordinator.refresh(job, patchFile).bind()   // report.lost: lots whose worker has gone
 ```
 
 On the same insurance book, holding 11,436 values a path (915 MB in all),
@@ -227,10 +234,10 @@ after one policy's promised amount changes, one run of each:
 | Two GPU workers sharing the card | 22.4 s | 0.37 s | the same |
 
 Both tables were measured before the coordinator and the worker were rewritten
-as actors. After the rewrite the same kinds of run gave the same answers, to
-the last bit, in about the same time: 16.3 s with one GPU worker, 20.3 s with
-two, and 0.24 s to bring a run held by two workers up to date (one run of
-each).
+as Surefold actors. After the rewrite the same kinds of run gave the same
+answers, to the last bit, in about the same time: 16.3 s with one GPU worker,
+21.1 s with two, and 0.24 s to bring a run held by two workers up to date
+(one run of each).
 
 The patch is 1 MB and works out 9,327 nodes for each path, of 19.9 million.
 A lot whose worker has gone since the first run cannot be brought up to

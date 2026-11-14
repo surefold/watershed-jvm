@@ -1,15 +1,27 @@
 package dev.surefold.watershed.cluster
 
 import dev.surefold.Promise
+import dev.surefold.Scope
 import dev.surefold.actor.remote.node
+import dev.surefold.awaitValue
 import dev.surefold.cluster.Discovery
 import dev.surefold.cluster.Downing
 import dev.surefold.cluster.Ready
 import dev.surefold.cluster.cluster
+import dev.surefold.fail.Either
+import dev.surefold.fail.Fail
+import dev.surefold.fail.attempt
+import dev.surefold.fail.bind
+import dev.surefold.fail.ensure
+import dev.surefold.fail.ensureNotNull
+import dev.surefold.fail.fail
+import dev.surefold.fail.fold
+import dev.surefold.fail.mapLeft
 import dev.surefold.scope
 import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.system.exitProcess
+import kotlin.time.Duration
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 
@@ -28,111 +40,174 @@ The coordinator is the seed: start it first, and give its host and port to each 
 its GPU if it has one (pick which with CUDA_VISIBLE_DEVICES) unless gpu=false, and until it is stopped.
 Workers that share one GPU are each told how much of its memory to use, with gpu-bytes."""
 
-private fun settings(args: List<String>): Map<String, String> = args.associate {
-    val at = it.indexOf('=')
-    require(at > 0) { "$it is not name=value" }
-    it.substring(0, at) to it.substring(at + 1)
+// What the command line asks for, once every setting has been read: nothing below this asks for one again.
+private sealed interface Command {
+    val host: String
+    val port: Int
+
+    data class Work(
+        override val host: String,
+        override val port: Int,
+        val name: String,
+        val seed: String,
+        val gpu: Boolean?,
+        val gpuBytes: Long?,
+    ) : Command
+
+    data class Coordinate(
+        override val host: String,
+        override val port: Int,
+        val job: Job,
+        val outputsPer: Int,
+        val workers: Int,
+        val wait: Duration,
+        val lotWithin: Duration,
+        val check: Path?,
+        val patch: Path?,
+        val checkAfter: Path?,
+    ) : Command
 }
 
-private fun Map<String, String>.need(name: String): String = this[name] ?: error("$name= is needed\n\n$USAGE")
+// Why the node did not do what it was started for: said on the way out, with the exit code that goes with it.
+private data class Stopped(val why: String, val code: Int)
 
-fun main(args: Array<String>) {
-    if (args.isEmpty()) {
-        println(USAGE)
-        exitProcess(2)
-    }
-    val set = settings(args.drop(1))
+private class Settings(args: List<String>) {
+    private val set: Map<String, String> = args.mapNotNull { arg ->
+        arg.indexOf('=').takeIf { it > 0 }?.let { arg.substring(0, it) to arg.substring(it + 1) }
+    }.toMap()
+
+    /** The arguments that are not name=value. */
+    val stray: List<String> = args.filter { it.indexOf('=') <= 0 }
+
+    operator fun get(name: String): String? = set[name]
+
+    context(_: Fail<Stopped>)
+    fun need(name: String): String = ensureNotNull(set[name]) { Stopped("$name= is needed\n\n$USAGE", 2) }
+
+    context(_: Fail<Stopped>)
+    fun <A : Any> read(name: String, what: String, parse: (String) -> A?): A? =
+        set[name]?.let { text -> ensureNotNull(parse(text)) { Stopped("$name=$text is not $what", 2) } }
+
+    context(_: Fail<Stopped>)
+    fun int(name: String): Int? = read(name, "a whole number", String::toIntOrNull)
+
+    context(_: Fail<Stopped>)
+    fun needInt(name: String): Int = ensureNotNull(need(name).toIntOrNull()) { Stopped("$name= is not a whole number", 2) }
+
+    context(_: Fail<Stopped>)
+    fun flag(name: String): Boolean? = read(name, "true or false", String::toBooleanStrictOrNull)
+}
+
+context(_: Fail<Stopped>)
+private fun command(args: Array<String>): Command {
+    val set = Settings(args.drop(1))
+    ensure(set.stray.isEmpty()) { Stopped("${set.stray} is not name=value\n\n$USAGE", 2) }
     val host = set["host"] ?: "127.0.0.1"
-    // Nodes of a batch job come and go by being stopped; one gone quiet is given up on after this long.
-    val downing = Downing.keepMajority(stableAfter = 10.seconds)
-    when (args[0]) {
-        "worker" -> scope {
-            val node = node(set.need("name"), set.need("port").toInt(), host = host)
-            // It joins, but is not counted a member that can be given lots until its worker is there to take them.
-            val cluster = cluster(
-                node,
-                Discovery.static(set.need("seed")),
-                downing = downing,
-                leaveWithin = 5.seconds,
-                roles = setOf(WORKER),
-                ready = Ready.WhenTold,
-            )
-            worker(node, gpu = set["gpu"]?.toBooleanStrict(), gpuBytes = set["gpu-bytes"]?.toLong())
-            cluster.admit()
-            println("worker ${node.self} is up")
-            // A latch nobody opens: the worker goes on until its process is stopped.
-            Promise<Nothing, Unit>("watershed-worker").await()
-        }
+    return when (args.firstOrNull()) {
+        "worker" -> Command.Work(
+            host, set.needInt("port"), set.need("name"), set.need("seed"), set.flag("gpu"),
+            set.read("gpu-bytes", "a whole number", String::toLongOrNull),
+        )
 
         "coordinator" -> {
-            val ok = scope {
-                val port = set.need("port").toInt()
-                val node = node("coordinator", port, host = host)
-                val cluster = cluster(node, Discovery.static("$host:$port"), downing = downing, leaveWithin = 5.seconds)
-                val coordinator = coordinator(node, cluster, lotWithin = (set["lot-within"]?.toInt() ?: 1800).seconds)
-                val job = Job(
-                    set["job"] ?: "job",
-                    Path.of(set.need("plan")),
-                    Path.of(set.need("inputs")),
-                    set.need("inputs-per").toInt(),
-                    set.need("lot").toInt(),
-                    Path.of(set.need("out")),
-                    columns = set["columns"]?.let { Files.readString(Path.of(it)).trim().split(",").map(String::toInt) }
-                        ?: emptyList(),
-                    hold = set["hold"]?.toBooleanStrict() ?: false,
-                )
-                val wanted = set["workers"]?.toInt() ?: 1
-                println("coordinator ${node.self}: ${job.scenarios} scenarios in ${job.lots} lots of ${job.lot}; waiting for $wanted workers")
-                if (!coordinator.awaitWorkers(wanted, (set["wait"]?.toInt() ?: 120).seconds)) {
-                    println("only ${coordinator.workers()} of $wanted workers joined")
-                    return@scope false
-                }
-                val report = coordinator.run(job, within = 600.minutes)
-                println("%5s  %-34s %4s %10s %10s".format("lot", "worker", "on", "loaded in", "ran in"))
-                for (lot in report.lots) {
-                    println("%5d  %-34s %4s %9.1fs %9.1fs".format(lot.lot, lot.worker, lot.on, lot.loadSeconds, lot.runSeconds))
-                }
-                report.failures.forEach { println("failed and given to another: $it") }
-                println("all ${job.lots} lots answered in ${report.took}; ${report.givenAgain} given out again")
-                val outputs = set.need("outputs-per").toInt()
-
-                // Whether the answers are, to the last bit, the numbers in a file.
-                fun same(check: String): Boolean {
-                    // Lot by lot, so that a big job's answers are never all in memory twice.
-                    var same = Files.size(Path.of(check)) == job.scenarios * outputs * 8
-                    for (lot in 0 until job.lots) {
-                        val count = job.count(lot) * outputs
-                        val ours = readNumbers(job.answers(lot), 0, count)
-                        val theirs = readNumbers(Path.of(check), job.first(lot) * outputs, count)
-                        same = same && ours.indices.all { ours[it].toRawBits() == theirs[it].toRawBits() }
-                    }
-                    println(
-                        if (same) "the answers are the same to the last bit as $check" else "THE ANSWERS DIFFER from $check",
-                    )
-                    return same
-                }
-
-                var ok = set["check"]?.let(::same) ?: true
-                set["patch"]?.let { patch ->
-                    val refreshed = coordinator.refresh(job, Path.of(patch))
-                    println()
-                    println("brought up to date with $patch:")
-                    for (lot in refreshed.lots) {
-                        println("%5d  %-34s %4s %9.3fs %9.3fs".format(lot.lot, lot.worker, lot.on, lot.loadSeconds, lot.runSeconds))
-                    }
-                    refreshed.failures.forEach { println("failed: $it") }
-                    println("${refreshed.lots.size} lots brought up to date in ${refreshed.took}; lost: ${refreshed.lost}")
-                    ok = ok && refreshed.lost.isEmpty()
-                    set["check-after"]?.let { ok = same(it) && ok }
-                }
-                ok
+            val columns = set["columns"]?.let { file ->
+                val text = Either.catch { Files.readString(Path.of(file)) }.mapLeft { Stopped("columns=$file: $it", 2) }.bind()
+                text.trim().split(",").map { ensureNotNull(it.trim().toIntOrNull()) { Stopped("columns=$file: $it is not a column", 2) } }
             }
-            exitProcess(if (ok) 0 else 1)
+            val job = Job.read(
+                set["job"] ?: "job",
+                Path.of(set.need("plan")),
+                Path.of(set.need("inputs")),
+                set.needInt("inputs-per"),
+                set.needInt("lot"),
+                Path.of(set.need("out")),
+                columns.orEmpty(),
+                set.flag("hold") ?: false,
+            ).mapLeft { Stopped(it.toString(), 2) }.bind()
+            Command.Coordinate(
+                host, set.needInt("port"), job, set.needInt("outputs-per"), set.int("workers") ?: 1,
+                (set.int("wait") ?: 120).seconds, (set.int("lot-within") ?: 1800).seconds,
+                set["check"]?.let(Path::of), set["patch"]?.let(Path::of), set["check-after"]?.let(Path::of),
+            )
         }
 
-        else -> {
-            println(USAGE)
-            exitProcess(2)
+        else -> fail(Stopped(USAGE, 2))
+    }
+}
+
+// Nodes of a batch job come and go by being stopped; one gone quiet is given up on after this long.
+private val downing = Downing.keepMajority(stableAfter = 10.seconds)
+
+private fun Scope<Stopped>.work(command: Command.Work) {
+    val node = node(command.name, command.port, host = command.host)
+    // It joins, but is not counted a member that can be given lots until its worker is there to take them.
+    val cluster = cluster(
+        node,
+        Discovery.static(command.seed),
+        downing = downing,
+        leaveWithin = 5.seconds,
+        roles = setOf(WORKER),
+        ready = Ready.WhenTold,
+    )
+    worker(node, gpu = command.gpu, gpuBytes = command.gpuBytes).mapLeft { Stopped("no GPU: ${it.why}", 1) }.bind()
+    cluster.admit()
+    println("worker ${node.self} is up")
+    // A latch nobody opens: the worker goes on until its process is stopped.
+    Promise<Nothing, Unit>("watershed-worker").awaitValue()
+}
+
+private fun Scope<Stopped>.coordinate(command: Command.Coordinate) {
+    val job = command.job
+    val node = node("coordinator", command.port, host = command.host)
+    val cluster = cluster(node, Discovery.static("${command.host}:${command.port}"), downing = downing, leaveWithin = 5.seconds)
+    val coordinator = coordinator(node, cluster, lotWithin = command.lotWithin)
+    println("coordinator ${node.self}: ${job.scenarios} scenarios in ${job.lots} lots of ${job.lot}; waiting for ${command.workers} workers")
+    ensure(coordinator.awaitWorkers(command.workers, command.wait)) {
+        Stopped("only ${coordinator.workers()} of ${command.workers} workers joined", 1)
+    }
+
+    val report = coordinator.run(job, within = 600.minutes).orStop()
+    println("%5s  %-34s %4s %10s %10s".format("lot", "worker", "on", "loaded in", "ran in"))
+    report.lots.forEach { println("%5d  %-34s %4s %9.1fs %9.1fs".format(it.lot, it.worker, it.on, it.loadSeconds, it.runSeconds)) }
+    report.failures.forEach { println("failed and given to another: $it") }
+    println("all ${job.lots} lots answered in ${report.took}; ${report.givenAgain} given out again")
+    command.check?.let { same(job, command.outputsPer, it) }
+
+    command.patch?.let { patch ->
+        val refreshed = coordinator.refresh(job, patch).orStop()
+        println()
+        println("brought up to date with $patch:")
+        refreshed.lots.forEach { println("%5d  %-34s %4s %9.3fs %9.3fs".format(it.lot, it.worker, it.on, it.loadSeconds, it.runSeconds)) }
+        refreshed.failures.forEach { println("failed: $it") }
+        println("${refreshed.lots.size} lots brought up to date in ${refreshed.took}; lost: ${refreshed.lost}")
+        ensure(refreshed.lost.isEmpty()) { Stopped("lots ${refreshed.lost} were lost", 1) }
+        command.checkAfter?.let { same(job, command.outputsPer, it) }
+    }
+}
+
+context(_: Fail<Stopped>)
+private fun <A> Either<JobFailure, A>.orStop(): A = mapLeft { Stopped(it.toString(), 1) }.bind()
+
+// Stops unless the job's answers are, to the last bit, the numbers in the file at [check].
+context(_: Fail<Stopped>)
+private fun same(job: Job, outputsPer: Int, check: Path) {
+    // Lot by lot, so that a big job's answers are never all in memory twice.
+    val same = countNumbers(check).orStop() == job.scenarios * outputsPer && (0 until job.lots).all { lot ->
+        val count = job.count(lot) * outputsPer
+        val ours = readNumbers(job.answers(lot), 0, count).orStop()
+        val theirs = readNumbers(check, job.first(lot) * outputsPer, count).orStop()
+        ours.indices.all { ours[it].toRawBits() == theirs[it].toRawBits() }
+    }
+    ensure(same) { Stopped("THE ANSWERS DIFFER from $check", 1) }
+    println("the answers are the same to the last bit as $check")
+}
+
+fun main(args: Array<String>) {
+    val ended = attempt<Stopped, Unit> {
+        when (val command = command(args)) {
+            is Command.Work -> scope { work(command) }
+            is Command.Coordinate -> scope { coordinate(command) }
         }
     }
+    exitProcess(ended.fold({ stopped -> println(stopped.why).let { stopped.code } }, { 0 }))
 }

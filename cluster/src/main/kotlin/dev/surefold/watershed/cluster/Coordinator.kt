@@ -1,6 +1,5 @@
 package dev.surefold.watershed.cluster
 
-import dev.surefold.Promise
 import dev.surefold.Scope
 import dev.surefold.Shared
 import dev.surefold.actor.ActorRef
@@ -14,28 +13,38 @@ import dev.surefold.actor.remote.Node
 import dev.surefold.actor.remote.RemoteNode
 import dev.surefold.actor.spawn
 import dev.surefold.actor.stay
+import dev.surefold.clock
 import dev.surefold.cluster.Cluster
 import dev.surefold.cluster.MemberEvent
 import dev.surefold.fail.Either
+import dev.surefold.fail.attempt
+import dev.surefold.fail.bind
+import dev.surefold.fail.ensure
+import dev.surefold.fail.flatMap
+import dev.surefold.fail.left
+import dev.surefold.fail.map
+import dev.surefold.fail.mapLeft
+import dev.surefold.fail.right
+import dev.surefold.fail.traverse
 import dev.surefold.logInfo
 import dev.surefold.timeoutOrNull
-import java.nio.file.Files
 import java.nio.file.Path
+import java.time.Instant
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
-import kotlin.time.TimeSource
+import kotlin.time.toKotlinDuration
 
 /**
- * A run of many scenarios to be cut into lots: the plan at [plan], the scenarios in the file at [inputs], [lot]
- * scenarios to a lot, and a folder, [out], that each lot's answers are written to. Every node must be able to
- * read [plan] and [inputs] and write to [out] under these same paths.
+ * A run of many scenarios to be cut into lots: the plan at [plan], the [scenarios] in the file at [inputs], [lot]
+ * of them to a lot, and a folder, [out], that each lot's answers are written to. Every node must be able to read
+ * [plan] and [inputs] and write to [out] under these same paths. [Job.read] makes one from the file itself.
  */
 data class Job(
     val id: String,
     val plan: Path,
     val inputs: Path,
-    val inputsPerScenario: Int,
+    val scenarios: Long,
     val lot: Int,
     val out: Path,
     /** Which of the plan's outputs are written as a scenario's answers, in order; all of them if empty. */
@@ -46,19 +55,33 @@ data class Job(
      */
     val hold: Boolean = false,
 ) {
-    val scenarios: Long = countNumbers(inputs) / inputsPerScenario
-    val lots: Int = Math.toIntExact((scenarios + lot - 1) / lot)
-
-    init {
-        require(lot > 0) { "a lot needs at least one scenario, was $lot" }
-        require(countNumbers(inputs) % inputsPerScenario == 0L) { "$inputs is not a whole number of scenarios" }
-    }
+    val lots: Int get() = Math.toIntExact((scenarios + lot - 1) / lot)
 
     fun first(lot: Int): Long = lot.toLong() * this.lot
 
     fun count(lot: Int): Int = minOf(this.lot.toLong(), scenarios - first(lot)).toInt()
 
     fun answers(lot: Int): Path = out.resolve("$id-lot-$lot")
+
+    companion object {
+        /** A job over every scenario in the file at [inputs], each of them [inputsPerScenario] numbers. */
+        fun read(
+            id: String,
+            plan: Path,
+            inputs: Path,
+            inputsPerScenario: Int,
+            lot: Int,
+            out: Path,
+            columns: List<Int> = emptyList(),
+            hold: Boolean = false,
+        ): Either<JobFailure, Job> = attempt {
+            ensure(lot > 0) { JobFailure.NotAJob("a lot needs at least one scenario, was $lot") }
+            ensure(inputsPerScenario > 0) { JobFailure.NotAJob("a scenario needs at least one input") }
+            val numbers = countNumbers(inputs).bind()
+            ensure(numbers % inputsPerScenario == 0L) { JobFailure.NotAJob("$inputs is not a whole number of scenarios") }
+            Job(id, plan, inputs, numbers / inputsPerScenario, lot, out, columns, hold)
+        }
+    }
 }
 
 /** One lot as it was run, for a report. */
@@ -80,9 +103,6 @@ data class Report(
      */
     val lost: List<Int> = emptyList(),
 )
-
-/** A job that could not be finished. */
-class JobFailed(why: String) : RuntimeException(why)
 
 /**
  * EXPERIMENTAL. Gives a job's lots to the cluster's workers and waits for their answers.
@@ -109,44 +129,30 @@ class Coordinator internal constructor(
         timeoutOrNull(within) { this.count.awaitUntil { it >= count } } != null
 
     /**
-     * Runs [job] on the cluster's workers and returns once every lot's answers are written, or throws [JobFailed]
-     * if a lot keeps failing or it is not done [within] that long. With [only], just those lots are run: the ones a
-     * refresh lost, with a plan made after the change.
+     * Runs [job] on the cluster's workers and answers once every lot's answers are written, or with why it could
+     * not be: a lot kept failing, or it was not done [within] that long. With [only], just those lots are run: the
+     * ones a refresh lost, with a plan made after the change.
      */
-    fun run(job: Job, within: Duration = 60.minutes, only: Collection<Int>? = null): Report {
-        Files.createDirectories(job.out)
-        return ended(within) { Run(job, only?.distinct(), within, it) }
-    }
+    fun run(job: Job, within: Duration = 60.minutes, only: Collection<Int>? = null): Either<JobFailure, Report> =
+        makeFolder(job.out).flatMap { ended(within) { Run(job, only?.distinct(), within, it) } }
 
     /**
      * Brings [job], which was run to be held, up to date with the patch in the file at [patch]: each worker runs
      * the patch on the lots it holds and writes their answers again. A lot whose worker has gone, or no longer
      * holds it, is left as it was and listed in the report's `lost`.
      */
-    fun refresh(job: Job, patch: Path, within: Duration = 60.minutes): Report =
+    fun refresh(job: Job, patch: Path, within: Duration = 60.minutes): Either<JobFailure, Report> =
         ended(within) { BringUpToDate(job, patch, within, it) }
 
     // The actor ends a round itself when its time is up; the wait here is a little longer, in case it has stopped.
-    private fun ended(within: Duration, round: (Reply<Ended>) -> CoordinatorTurn): Report =
-        when (val ended = actor.ask<CoordinatorTurn, Ended>(within + 30.seconds, round)) {
-            is Either.Left -> throw JobFailed("the coordinator gave no answer: ${ended.value}")
-            is Either.Right -> when (val how = ended.value) {
-                is Ended.Done -> how.report
-                is Ended.Failed -> throw JobFailed(how.why)
-            }
-        }
+    private fun ended(within: Duration, round: (Reply<Either<JobFailure, Report>>) -> CoordinatorTurn): Either<JobFailure, Report> =
+        actor.ask(within + 30.seconds, round).mapLeft { JobFailure.NoAnswer(it.toString()) }.flatMap { it }
 
     /** Every scenario's answers, in order, once [job] has run: its lots' files put together. */
-    fun answers(job: Job, outputsPerScenario: Int): DoubleArray {
-        val all = DoubleArray(Math.toIntExact(job.scenarios * outputsPerScenario))
-        var at = 0
-        for (lot in 0 until job.lots) {
-            val part = readNumbers(job.answers(lot), 0, job.count(lot) * outputsPerScenario)
-            part.copyInto(all, at)
-            at += part.size
-        }
-        return all
-    }
+    fun answers(job: Job, outputsPerScenario: Int): Either<JobFailure, DoubleArray> =
+        (0 until job.lots)
+            .traverse<JobFailure, Int, DoubleArray> { readNumbers(job.answers(it), 0, job.count(it) * outputsPerScenario).bind() }
+            .map { parts -> parts.flatMap(DoubleArray::asList).toDoubleArray() }
 }
 
 /**
@@ -171,9 +177,9 @@ fun Scope<*>.coordinator(
 // What this node tells the coordinator's actor, beside what workers tell it.
 private data class Member(val event: MemberEvent) : CoordinatorTurn
 
-private data class Run(val job: Job, val only: List<Int>?, val within: Duration, val reply: Reply<Ended>) : CoordinatorTurn
+private data class Run(val job: Job, val only: List<Int>?, val within: Duration, val reply: Reply<Either<JobFailure, Report>>) : CoordinatorTurn
 
-private data class BringUpToDate(val job: Job, val patch: Path, val within: Duration, val reply: Reply<Ended>) : CoordinatorTurn
+private data class BringUpToDate(val job: Job, val patch: Path, val within: Duration, val reply: Reply<Either<JobFailure, Report>>) : CoordinatorTurn
 
 // Its own timers: a worker that did not say whether it took a lot, a lot out too long, a worker left alone long
 // enough, and a round out of time.
@@ -185,33 +191,39 @@ private data class Rested(val node: Node) : CoordinatorTurn
 
 private data class OutOfTime(val tag: String) : CoordinatorTurn
 
-internal sealed interface Ended {
-    data class Done(val report: Report) : Ended
+// What a worker is doing, as far as the coordinator knows.
+private sealed interface Doing {
+    data object Idle : Doing
 
-    data class Failed(val why: String) : Ended
+    /** Offered [lot], and yet to say whether it takes it. */
+    data class Offered(val lot: Int) : Doing
+
+    data class Running(val lot: Int) : Doing
+
+    /** Asked nothing for a moment: it was busy, or gave no answer, or may be about to go. */
+    data object Resting : Doing
 }
 
-// A worker as the coordinator sees it: the lot it has been offered, and whether it has said it took it.
-private data class Hand(
-    val ref: ActorRef<ToWorker>,
-    val usable: Boolean = true,
-    val lot: Int? = null,
-    val taken: Boolean = false,
-    val resting: Boolean = false,
-) {
-    val idle: Boolean get() = usable && lot == null && !resting
+// A worker as the coordinator sees it. One that cannot be reached is kept, not usable, until it is back or gone.
+private data class Hand(val ref: ActorRef<ToWorker>, val doing: Doing = Doing.Idle, val usable: Boolean = true) {
+    val idle: Boolean get() = usable && doing == Doing.Idle
 
-    fun free(): Hand = copy(lot = null, taken = false)
+    val lot: Int?
+        get() = when (doing) {
+            is Doing.Offered -> doing.lot
+            is Doing.Running -> doing.lot
+            Doing.Idle, Doing.Resting -> null
+        }
 }
 
 // One run of a job, or one bringing of it up to date, while it is going on.
 private data class Round(
     val job: Job,
     val tag: String,
-    val reply: Reply<Ended>,
+    val reply: Reply<Either<JobFailure, Report>>,
     val within: Duration,
     val lots: Int,
-    val started: TimeSource.Monotonic.ValueTimeMark = TimeSource.Monotonic.markNow(),
+    val started: Instant,
     // The patch, when lots are being brought up to date and not run.
     val patch: Path? = null,
     // A run's lots not out with any worker; any idle worker may take the first.
@@ -231,7 +243,7 @@ private data class Round(
     fun next(node: Node): Int? = if (refreshing) asked[node]?.firstOrNull() else waiting.firstOrNull()
 
     fun out(node: Node): Round =
-        if (refreshing) copy(asked = asked + (node to asked.getValue(node).drop(1))) else copy(waiting = waiting.drop(1))
+        if (refreshing) copy(asked = asked + (node to asked[node].orEmpty().drop(1))) else copy(waiting = waiting.drop(1))
 
     /** [lot] was offered to [node], which did not take it: it is to be offered again. */
     fun unoffered(node: Node, lot: Int): Round = when {
@@ -251,6 +263,15 @@ private data class Round(
 
     fun answered(run: LotRun): Round =
         copy(done = if (run.lot in done) done else done + (run.lot to run), waiting = waiting - run.lot, lost = lost - run.lot)
+
+    /** When bringing up to date: a holder that is not among [usable] has lost what it held. */
+    fun withoutHolders(usable: Set<Node>): Round = asked.entries.fold(this) { round, (at, lots) ->
+        if (at in usable || lots.isEmpty()) {
+            round
+        } else {
+            round.copy(asked = round.asked + (at to emptyList()), lost = round.lost + lots.filter { it !in round.done })
+        }
+    }
 }
 
 // Everything the coordinator's actor knows.
@@ -263,9 +284,9 @@ private data class Table(
 ) {
     fun with(node: Node, hand: Hand): Table = copy(hands = hands + (node to hand))
 
-    fun named(worker: String): Pair<Node, Hand>? = hands.entries.firstOrNull { it.key.toString() == worker }?.toPair()
+    fun with(round: Round): Table = copy(round = round)
 
-    fun round(tag: String): Round? = round?.takeIf { it.tag == tag }
+    fun named(worker: String): Pair<Node, Hand>? = hands.entries.firstOrNull { it.key.toString() == worker }?.toPair()
 }
 
 // The coordinator's turns: what each message does to the table.
@@ -278,35 +299,26 @@ private class Dealer(
 ) {
     private val answerWithin = 5.seconds
 
-    fun turn(ctx: Ctx<CoordinatorTurn>, table: Table, told: CoordinatorTurn): Table = dealt(
-        ctx,
-        when (told) {
+    fun turn(ctx: Ctx<CoordinatorTurn>, table: Table, told: CoordinatorTurn): Table {
+        val round = table.round
+        val next = when (told) {
             is Member -> member(ctx, table, told.event)
-            is Run -> run(ctx, table, told)
-            is BringUpToDate -> bringUpToDate(ctx, table, told)
-            is Answer -> answer(ctx, table, told)
-            is Outcome -> outcome(ctx, table, told)
-            is Unanswered -> table.hands[told.node]
-                ?.takeIf { table.round(told.tag) != null && it.lot == told.lot && !it.taken }
-                ?.let { refused(ctx, table, told.node, it, told.lot) }
-                ?: table
-
-            is Late -> table.hands[told.node]
-                ?.takeIf { table.round(told.tag) != null && it.lot == told.lot && it.taken }
-                ?.let {
-                    // It may still be busy with it: leave it be for a while.
-                    logInfo("coordinator: lot ${told.lot} has been with ${told.node} longer than $lotWithin")
-                    ctx.timers.after("rest" to told.node, 10.seconds, Rested(told.node))
-                    table.with(told.node, it.free().copy(resting = true)).copy(round = table.round?.back(told.lot))
+            is Run -> begin(ctx, table, told.reply) { run(table, told) }
+            is BringUpToDate -> begin(ctx, table, told.reply) { bringUpToDate(table, told) }
+            is Rested -> rested(table, told.node)
+            // Everything else is about one round, and means nothing once that round is over.
+            is FromWorker -> if (round?.tag == told.tag) fromWorker(ctx, table, round, told) else table
+            is Unanswered -> if (round?.tag == told.tag) unanswered(ctx, table, round, told) else table
+            is Late -> if (round?.tag == told.tag) late(ctx, table, round, told) else table
+            is OutOfTime ->
+                if (round?.tag == told.tag) {
+                    ended(ctx, table, round, JobFailure.OutOfTime(round.done.size, round.lots, round.within).left())
+                } else {
+                    table
                 }
-                ?: table
-
-            is Rested -> table.hands[told.node]?.let { table.with(told.node, it.copy(resting = false)) } ?: table
-            is OutOfTime -> table.round(told.tag)
-                ?.let { failed(ctx, table, "${it.done.size} of ${it.lots} lots were answered after ${it.within}") }
-                ?: table
-        },
-    )
+        }
+        return dealt(ctx, next)
+    }
 
     private fun member(ctx: Ctx<CoordinatorTurn>, table: Table, event: MemberEvent): Table {
         val member = event.member
@@ -319,14 +331,14 @@ private class Dealer(
             // a moment, so that a lot is not offered to a worker that is about to be gone.
             is MemberEvent.Reachable if known != null -> {
                 ctx.timers.after("rest" to at, 1.seconds, Rested(at))
-                table.with(at, known.copy(usable = true, resting = true))
+                table.with(at, known.copy(usable = true, doing = Doing.Resting))
             }
 
             is MemberEvent.Up, is MemberEvent.Reachable ->
                 gone(ctx, table, at).with(at, Hand(node.remote(Address(at.toString(), WORKER_PATH, 0), ToWorkerCodec)))
 
             is MemberEvent.Unreachable ->
-                if (known == null) table else gone(ctx, table, at).with(at, known.free().copy(usable = false))
+                if (known == null) table else gone(ctx, table, at).with(at, known.copy(doing = Doing.Idle, usable = false))
 
             is MemberEvent.Downed, is MemberEvent.Removed -> gone(ctx, table, at)
         }
@@ -342,117 +354,139 @@ private class Dealer(
         return table.copy(hands = table.hands - at, round = if (lot == null) table.round else table.round?.back(lot))
     }
 
-    private fun run(ctx: Ctx<CoordinatorTurn>, table: Table, told: Run): Table {
+    private fun rested(table: Table, at: Node): Table {
+        val hand = table.hands[at]
+        return if (hand?.doing == Doing.Resting) table.with(at, hand.copy(doing = Doing.Idle)) else table
+    }
+
+    // Starts the round [make] answers, or tells whoever asked for it why there is none.
+    private fun begin(
+        ctx: Ctx<CoordinatorTurn>,
+        table: Table,
+        reply: Reply<Either<JobFailure, Report>>,
+        make: () -> Either<JobFailure, Round>,
+    ): Table = when (val made = make()) {
+        is Either.Left -> table.also { reply(made) }
+        is Either.Right -> {
+            ctx.timers.after("round", made.value.within, OutOfTime(made.value.tag))
+            table.copy(round = made.value, rounds = table.rounds + 1)
+        }
+    }
+
+    private fun run(table: Table, told: Run): Either<JobFailure, Round> = attempt {
         val job = told.job
         val lots = told.only ?: (0 until job.lots).toList()
-        val why = when {
-            table.round != null -> "one job at a time: ${table.round.job.id} is still running"
-            !lots.all { it in 0 until job.lots } -> "the job has lots 0 to ${job.lots - 1}, not all of $lots"
-            else -> null
-        }
-        if (why != null) return table.also { told.reply(Ended.Failed(why)) }
-        return begun(ctx, table, Round(job, "${job.id}#${table.rounds + 1}", told.reply, told.within, lots.size, waiting = lots))
+        ensure(table.round == null) { JobFailure.Busy(table.round?.job?.id.orEmpty()) }
+        ensure(lots.all { it in 0 until job.lots }) { JobFailure.NoSuchLots(lots, job.lots) }
+        Round(job, tag(table, job), told.reply, told.within, lots.size, clock.get().now(), waiting = lots)
     }
 
-    private fun bringUpToDate(ctx: Ctx<CoordinatorTurn>, table: Table, told: BringUpToDate): Table {
+    private fun bringUpToDate(table: Table, told: BringUpToDate): Either<JobFailure, Round> = attempt {
         val job = told.job
+        ensure(table.round == null) { JobFailure.Busy(table.round?.job?.id.orEmpty()) }
         val holding = table.holders[job.id]
-        val why = when {
-            table.round != null -> "one job at a time: ${table.round.job.id} is still running"
-            holding == null -> "no run of ${job.id} is held"
-            else -> null
-        }
-        if (why != null || holding == null) return table.also { told.reply(Ended.Failed(why ?: "no run of ${job.id} is held")) }
+        ensure(holding != null) { JobFailure.NotHeld(job.id) }
         val (held, lost) = (0 until job.lots).partition { it in holding }
-        val round = Round(
-            job, "${job.id}#${table.rounds + 1}", told.reply, told.within, job.lots,
+        Round(
+            job, tag(table, job), told.reply, told.within, job.lots, clock.get().now(),
             patch = told.patch, asked = held.groupBy { holding.getValue(it) }, lost = lost.toSet(),
         )
-        return begun(ctx, table, round)
     }
 
-    private fun begun(ctx: Ctx<CoordinatorTurn>, table: Table, round: Round): Table {
-        ctx.timers.after("round", round.within, OutOfTime(round.tag))
-        return table.copy(round = round, rounds = table.rounds + 1)
-    }
+    // Each round has a tag of its own, so that a late answer from an earlier run of the same job is not counted.
+    private fun tag(table: Table, job: Job): String = "${job.id}#${table.rounds + 1}"
 
-    private fun answer(ctx: Ctx<CoordinatorTurn>, table: Table, told: Answer): Table {
-        val round = table.round(told.tag) ?: return table
+    private fun fromWorker(ctx: Ctx<CoordinatorTurn>, table: Table, round: Round, told: FromWorker): Table {
         val (at, hand) = table.named(told.worker) ?: return table
-        if (hand.lot != told.lot || hand.taken) {
-            // It answered after it was given up on. If it took the lot and nobody else has it yet, it is still its.
-            if (told.answer != TAKEN || hand.lot != null || round.refreshing || told.lot !in round.waiting) return table
-            ctx.timers.cancel("rest" to at)
-            ctx.timers.after("lot" to at, lotWithin, Late(round.tag, at, told.lot))
-            return table.with(at, hand.copy(lot = told.lot, taken = true, resting = false))
-                .copy(round = round.copy(waiting = round.waiting - told.lot))
+        return when (told) {
+            is Answer -> answer(ctx, table, round, at, hand, told)
+            is Ran -> freed(ctx, table, at, hand, told.lot)
+                .with(round.answered(LotRun(told.lot, told.worker, told.on, told.loadSeconds, told.runSeconds)))
+
+            is Failed -> failed(ctx, freed(ctx, table, at, hand, told.lot), round, told)
         }
-        ctx.timers.cancel("offer" to at)
-        return when (told.answer) {
-            TAKEN -> {
+    }
+
+    private fun answer(ctx: Ctx<CoordinatorTurn>, table: Table, round: Round, at: Node, hand: Hand, told: Answer): Table {
+        val offered = hand.doing == Doing.Offered(told.lot)
+        // An answer after it was given up on: if it took the lot and nobody else has it yet, it is still its.
+        val late = !offered && told.taking == Taking.Taken && hand.lot == null && !round.refreshing && told.lot in round.waiting
+        if (offered) ctx.timers.cancel("offer" to at)
+        return when {
+            late || (offered && told.taking == Taking.Taken) -> {
+                ctx.timers.cancel("rest" to at)
                 ctx.timers.after("lot" to at, lotWithin, Late(round.tag, at, told.lot))
-                table.with(at, hand.copy(taken = true))
+                table.with(at, hand.copy(doing = Doing.Running(told.lot))).with(round.copy(waiting = round.waiting - told.lot))
             }
 
-            NOT_HELD -> table.with(at, hand.free()).copy(round = round.copy(lost = round.lost + told.lot))
-            else -> refused(ctx, table, at, hand, told.lot)
+            !offered -> table
+            told.taking == Taking.NotHeld ->
+                table.with(at, hand.copy(doing = Doing.Idle)).with(round.copy(lost = round.lost + told.lot))
+
+            else -> refused(ctx, table, round, at, hand, told.lot)
         }
+    }
+
+    private fun unanswered(ctx: Ctx<CoordinatorTurn>, table: Table, round: Round, told: Unanswered): Table {
+        val hand = table.hands[told.node]
+        return if (hand?.doing == Doing.Offered(told.lot)) refused(ctx, table, round, told.node, hand, told.lot) else table
     }
 
     // Busy, or no answer: the lot is offered again, and this worker is asked nothing for a moment.
-    private fun refused(ctx: Ctx<CoordinatorTurn>, table: Table, at: Node, hand: Hand, lot: Int): Table {
+    private fun refused(ctx: Ctx<CoordinatorTurn>, table: Table, round: Round, at: Node, hand: Hand, lot: Int): Table {
         logInfo("coordinator: $at did not take lot $lot")
         ctx.timers.after("rest" to at, 2.seconds, Rested(at))
-        return table.with(at, hand.free().copy(resting = true)).copy(round = table.round?.unoffered(at, lot))
+        return table.with(at, hand.copy(doing = Doing.Resting)).with(round.unoffered(at, lot))
     }
 
-    private fun outcome(ctx: Ctx<CoordinatorTurn>, table: Table, told: Outcome): Table {
-        val round = table.round(told.tag) ?: return table
-        val freed = table.named(told.worker)?.takeIf { it.second.lot == told.lot }?.let { (at, hand) ->
-            listOf("offer", "lot").forEach { ctx.timers.cancel(it to at) }
-            table.with(at, hand.free())
-        } ?: table
-        if (told.failed == null) {
-            val run = LotRun(told.lot, told.worker, told.on, told.loadSeconds, told.runSeconds)
-            return freed.copy(round = round.answered(run))
-        }
-        if (told.lot in round.done) return freed
+    private fun late(ctx: Ctx<CoordinatorTurn>, table: Table, round: Round, told: Late): Table {
+        val hand = table.hands[told.node]
+        if (hand?.doing != Doing.Running(told.lot)) return table
+        logInfo("coordinator: lot ${told.lot} has been with ${told.node} longer than $lotWithin")
+        // It may still be busy with it: leave it be for a while.
+        ctx.timers.after("rest" to told.node, 10.seconds, Rested(told.node))
+        return table.with(told.node, hand.copy(doing = Doing.Resting)).with(round.back(told.lot))
+    }
+
+    // The worker has said how [lot] went, so it no longer has it.
+    private fun freed(ctx: Ctx<CoordinatorTurn>, table: Table, at: Node, hand: Hand, lot: Int): Table {
+        if (hand.lot != lot) return table
+        listOf("offer", "lot").forEach { ctx.timers.cancel(it to at) }
+        return table.with(at, hand.copy(doing = Doing.Idle))
+    }
+
+    private fun failed(ctx: Ctx<CoordinatorTurn>, table: Table, round: Round, told: Failed): Table {
+        if (told.lot in round.done) return table
         val tried = (round.tries[told.lot] ?: 0) + 1
         val noted = round.copy(
             tries = round.tries + (told.lot to tried),
-            failures = round.failures + "lot ${told.lot} on ${told.worker}: ${told.failed}",
+            failures = round.failures + "lot ${told.lot} on ${told.worker}: ${told.why}",
         )
         return when {
             // Brought up to date by nobody else: the lot is left as it was, and reported lost.
-            round.refreshing -> freed.copy(round = noted.copy(lost = noted.lost + told.lot))
+            round.refreshing -> table.with(noted.copy(lost = noted.lost + told.lot))
             tried >= attempts ->
-                failed(ctx, freed, "lot ${told.lot} failed $tried times, last on ${told.worker}: ${told.failed}")
+                ended(ctx, table, noted, JobFailure.LotKeptFailing(told.lot, tried, told.worker, told.why).left())
 
-            else -> freed.copy(round = noted.back(told.lot))
+            else -> table.with(noted.back(told.lot))
         }
     }
 
     // After every turn: ends a round that is over, and otherwise offers a lot to each idle worker.
     private fun dealt(ctx: Ctx<CoordinatorTurn>, table: Table): Table {
-        var round = table.round ?: return table
-        if (round.refreshing) {
-            // A holder that has gone has lost what it held.
-            for ((at, lots) in round.asked) {
-                if (lots.isNotEmpty() && table.hands[at]?.usable != true) {
-                    round = round.copy(asked = round.asked + (at to emptyList()), lost = round.lost + lots.filter { it !in round.done })
-                }
-            }
-        }
-        if (round.over) return finished(ctx, table.copy(round = round))
-        var hands = table.hands
-        for ((at, hand) in table.hands) {
-            val lot = round.next(at)?.takeIf { hand.idle } ?: continue
-            round = round.out(at)
-            hand.ref.tell(offer(ctx, round, lot))
-            ctx.timers.after("offer" to at, answerWithin, Unanswered(round.tag, at, lot))
-            hands = hands + (at to hand.copy(lot = lot))
-        }
-        return table.copy(hands = hands, round = round)
+        val usable = table.hands.filterValues { it.usable }.keys
+        val round = table.round?.withoutHolders(usable) ?: return table
+        if (round.over) return finished(ctx, table, round)
+        return table.hands.entries.fold(table.with(round)) { dealing, (at, hand) -> offered(ctx, dealing, at, hand) }
+    }
+
+    private fun offered(ctx: Ctx<CoordinatorTurn>, table: Table, at: Node, hand: Hand): Table {
+        val round = table.round
+        val lot = round?.next(at)
+        if (round == null || lot == null || !hand.idle) return table
+        hand.ref.tell(offer(ctx, round, lot))
+        ctx.timers.after("offer" to at, answerWithin, Unanswered(round.tag, at, lot))
+        return table.with(at, hand.copy(doing = Doing.Offered(lot))).with(round.out(at))
     }
 
     private fun offer(ctx: Ctx<CoordinatorTurn>, round: Round, lot: Int): ToWorker {
@@ -468,37 +502,31 @@ private class Dealer(
         }
     }
 
-    private fun finished(ctx: Ctx<CoordinatorTurn>, table: Table): Table {
-        val round = table.round ?: return table
-        val before = table.holders[round.job.id]
+    private fun finished(ctx: Ctx<CoordinatorTurn>, table: Table, round: Round): Table {
+        val before = table.holders[round.job.id].orEmpty()
         val nodes = table.hands.keys.associateBy { it.toString() }
         val holding = when {
-            round.refreshing -> before.orEmpty() - round.lost
+            round.refreshing -> before - round.lost
             // Whoever ran a lot now holds it; a lot run by a worker that has since gone is held by nobody.
-            round.job.hold -> round.done.values.fold(before.orEmpty()) { held, run ->
+            round.job.hold -> round.done.values.fold(before) { held, run ->
                 nodes[run.worker]?.let { held + (run.lot to it) } ?: (held - run.lot)
             }
 
             else -> before
         }
-        val report = Report(
-            round.done.values.sortedBy { it.lot }, round.givenAgain, round.failures, round.started.elapsedNow(),
-            round.lost.sorted(),
-        )
-        round.reply(Ended.Done(report))
-        val cleared = cleared(ctx, table)
-        return if (holding == null) cleared else cleared.copy(holders = cleared.holders + (round.job.id to holding))
+        val took = java.time.Duration.between(round.started, clock.get().now()).toKotlinDuration()
+        val report = Report(round.done.values.sortedBy { it.lot }, round.givenAgain, round.failures, took, round.lost.sorted())
+        val ended = ended(ctx, table, round, report.right())
+        return if (holding.isEmpty()) ended else ended.copy(holders = ended.holders + (round.job.id to holding))
     }
 
-    private fun failed(ctx: Ctx<CoordinatorTurn>, table: Table, why: String): Table {
-        table.round?.reply?.invoke(Ended.Failed(why))
-        return cleared(ctx, table)
-    }
-
-    // The round is over: no worker has a lot of it, and none of its timers is left.
-    private fun cleared(ctx: Ctx<CoordinatorTurn>, table: Table): Table {
+    // The round is over, one way or the other: whoever asked for it is told, no worker has a lot of it, and none
+    // of its timers is left.
+    private fun ended(ctx: Ctx<CoordinatorTurn>, table: Table, round: Round, how: Either<JobFailure, Report>): Table {
+        round.reply(how)
         ctx.timers.cancel("round")
         table.hands.keys.forEach { at -> listOf("offer", "lot").forEach { ctx.timers.cancel(it to at) } }
-        return table.copy(hands = table.hands.mapValues { it.value.free() }, round = null)
+        val idle = table.hands.mapValues { (_, hand) -> if (hand.lot == null) hand else hand.copy(doing = Doing.Idle) }
+        return table.copy(hands = idle, round = null)
     }
 }
