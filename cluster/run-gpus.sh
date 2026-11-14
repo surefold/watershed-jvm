@@ -6,7 +6,8 @@
 #     cluster/run-gpus.sh PREFIX LOT [GPUS=all of them] [IMAGE=ghcr.io/surefold/watershed-cluster:latest]
 #                         [INPUTS_PER=240] [OUTPUTS_PER=4]
 #
-# PREFIX is where the job's files are in the bucket: PREFIX/plan, PREFIX/paths and, to compare the answers with,
+# PREFIX is where the job's files are in the bucket: PREFIX/plan, PREFIX/paths (best put there in pieces, with
+# put.piece-mb, so that a worker fetches only what its lot needs) and, to compare the answers with,
 # PREFIX/whole. The answers go to PREFIX/out. Set PLAN to use a plan that is somewhere else in the bucket, for
 # scenarios that share one. The bucket comes from the environment, and its keys from nowhere else:
 #

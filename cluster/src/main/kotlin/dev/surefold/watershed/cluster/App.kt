@@ -67,7 +67,7 @@ class Asked internal constructor(
     val checkAfter: String,
 )
 
-class Putting internal constructor(val from: String, val key: String)
+class Putting internal constructor(val from: String, val key: String, val pieceMb: Int)
 
 // The bucket, and the store on it.
 private val bucket: Module =
@@ -188,11 +188,11 @@ object Put : SurefoldApp<Upload>() {
 
     override val module: Module =
         loadedConfig() + bucket +
-            config<Putting>("watershed.put") { Putting(string("from"), string("key")) } +
+            config<Putting>("watershed.put") { Putting(string("from"), string("key"), int("piece-mb")) } +
             single { store: Store, putting: Putting -> Upload(store, putting) }
 
     override fun AppScope.run(root: Upload) {
-        root.store.upload(root.putting.from, root.putting.key).fold(
+        root.store.upload(root.putting.from, root.putting.key, root.putting.pieceMb * 1024L * 1024L).fold(
             { why -> logError("${why.key}: ${why.why}").also { failed.update { true } } },
             { logInfo("${root.putting.from} is at ${root.putting.key}") },
         )

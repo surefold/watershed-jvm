@@ -20,6 +20,25 @@ object StoreSuite : Suite() {
                 listOf(back.first().toRawBits(), back.last().toRawBits()) shouldBe listOf(0, count - 1).map { bits(it) }
             }
         }
+
+        test("A part of a file put there in pieces is read from the pieces it is in") {
+            withTempDirectory("watershed-store") { folder ->
+                val store = Store(InMemoryFiles())
+                val file = folder.resolve("numbers").also { it.writeBytes(ByteArray(1_000 * 8) { (it % 251).toByte() }) }
+                // Pieces of 96 numbers: the last is shorter, and a part can lie across several.
+                store.upload(file.pathString, "book/numbers", 96 * 8).shouldBeRight()
+                store.pieced("book/numbers").shouldBeRight() shouldBe true
+                store.count("book/numbers").shouldBeRight() shouldBe 1_000L
+                listOf(0 to 10, 90 to 20, 95 to 300, 960 to 40, 999 to 1, 500 to 0).forEach { (from, count) ->
+                    val part = store.read("book/numbers", from.toLong(), count).shouldBeRight()
+                    part.map { it.toRawBits() } shouldBe (from until from + count).map { bits(it) }
+                }
+                store.read("book/numbers", 990, 11).isLeft() shouldBe true
+                // A file there whole is not in pieces.
+                store.upload(file.pathString, "book/whole").shouldBeRight()
+                store.pieced("book/whole").shouldBeRight() shouldBe false
+            }
+        }
     }
 }
 
