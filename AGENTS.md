@@ -48,6 +48,13 @@ with the classifier `test-fixtures`), and in their docs. If Surefold has it, use
   its file, its helpers below it.
 - **A cluster is built from Surefold's cluster**: sharded entities, a singleton, membership. Nothing here assigns work
   to nodes by hand.
+- **What crosses between nodes is a `@Serializable` class**, written by `surefold-actor-remote-kotlinx`'s `Kotlinx`
+  codecs. No codec is written field by field. A message carries data, not who to answer: an actor that must be
+  answered is reached by its name in the cluster.
+- **An actor's logic is tested on Surefold's test actors** (`testActors`, `advance`): no nodes, no threads, no
+  waiting. A test starts real nodes only for what real nodes are the point of.
+- **Log lines go to SLF4J** through `surefold-slf4j`, with one backend for the program, so a library's lines and
+  Surefold's come out in one place.
 - **Comments say why**, in a line or two. They do not restate the code or tell its history.
 
 ## The check

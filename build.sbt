@@ -118,6 +118,8 @@ lazy val cluster = (project in file("cluster"))
   .settings(jdk, kotlinModule, native, suites)
   .settings(
     name := "watershed-cluster",
+    // What crosses between nodes is written by kotlinx.serialization from the classes themselves.
+    kotlinPlugin("serialization-compiler-plugin-embeddable"),
     libraryDependencies ++= Seq(
       "dev.surefold" % "surefold-cluster" % surefold,
       // A node is a Surefold application: a graph built from configuration, its cluster joined as a section says.
@@ -125,6 +127,10 @@ lazy val cluster = (project in file("cluster"))
       "dev.surefold" % "surefold-app-actor" % surefold,
       "dev.surefold" % "surefold-app-typesafe" % "0.18.0",
       "dev.surefold" % "surefold-app-cluster" % "0.18.0",
+      "dev.surefold" % "surefold-actor-remote-kotlinx" % "0.18.0",
+      // One place for every log line: Surefold's go to SLF4J, where the S3 client's already do, and SLF4J writes them.
+      "dev.surefold" % "surefold-slf4j" % "0.18.0",
+      "org.slf4j" % "slf4j-simple" % "1.7.36",
       // A bucket every node reaches. Surefold's platform modules are published at 0.18.0, one behind its core.
       "dev.surefold" % "surefold-files" % "0.18.0",
       // Surefold's own test fixtures for nodes: a port nothing listens on, for a node a test starts.

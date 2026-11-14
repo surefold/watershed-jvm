@@ -14,7 +14,6 @@ import dev.surefold.fail.ensure
 import dev.surefold.fail.ensureNotNull
 import dev.surefold.fail.fold
 import dev.surefold.fail.mapLeft
-import dev.surefold.logInfo
 import dev.surefold.watershed.Gpu
 import dev.surefold.watershed.Held
 import dev.surefold.watershed.Patch
@@ -44,22 +43,22 @@ internal data class Desk(val doing: Doing = Doing.Idle, val held: Held? = null) 
 }
 
 // What the bench tells a lot when it has run what the lot gave it.
-internal data class Finished(val tag: String, val outcome: FromLot, val from: ActorRef<FromLot>, val held: Held?) : LotTurn
+internal data class Finished(val tag: String, val outcome: FromLot, val held: Held?) : LotTurn
 
 // What a lot gives the bench: what it was told, what it holds, and itself to tell back.
 internal data class Work(val told: Task, val held: Held?, val back: ActorRef<LotTurn>)
 
-internal fun lot(worker: String, bench: ActorRef<Work>): Behaviour<LotTurn, Desk, Nothing> = behaviour(Desk()) { ctx, desk, told ->
+internal fun lot(worker: String, bench: ActorRef<Work>, coordinator: (FromLot) -> Unit): Behaviour<LotTurn, Desk, Nothing> = behaviour(Desk()) { ctx, desk, told ->
     when (told) {
-        is Where -> stay().also { told.from.tell(At(told.tag, told.lot, worker, told.id)) }
+        is Where -> stay().also { coordinator(At(told.tag, told.lot, worker, told.id)) }
 
         is Task -> when {
             // Told again what it is already doing, or has done: the coordinator asks again when it has heard nothing.
             desk.doing == Desk.Doing.Working(told.tag) -> stay()
-            desk.doing is Desk.Doing.Done && desk.doing.tag == told.tag -> stay().also { told.from.tell(desk.doing.outcome) }
-            told is BringUpToDate && desk.held == null -> stay().also { told.from.tell(NotHeld(told.tag, told.lot, worker)) }
+            desk.doing is Desk.Doing.Done && desk.doing.tag == told.tag -> stay().also { coordinator(desk.doing.outcome) }
+            told is BringUpToDate && desk.held == null -> stay().also { coordinator(NotHeld(told.tag, told.lot, worker)) }
             else -> {
-                told.from.tell(Queued(told.tag, told.lot, worker))
+                coordinator(Queued(told.tag, told.lot, worker))
                 bench.tell(Work(told, desk.held, ctx.self))
                 become(desk.copy(doing = Desk.Doing.Working(told.tag)))
             }
@@ -67,18 +66,24 @@ internal fun lot(worker: String, bench: ActorRef<Work>): Behaviour<LotTurn, Desk
 
         // Only what it is still working on counts: a lot told something newer meanwhile has moved on.
         is Finished -> if (desk.doing == Desk.Doing.Working(told.tag)) {
-            told.from.tell(told.outcome)
+            coordinator(told.outcome)
             become(Desk(Desk.Doing.Done(told.tag, told.outcome), told.held ?: desk.held))
         } else {
             stay()
         }
 
-        is NotUnderstood -> stay().also { logInfo("lot: a message of kind ${told.kind} was not understood") }
     }
 }
 
 // What a bench is given once and never changes.
-internal class Rig(val worker: String, val store: Store, val card: Gpu?, val gpuBytes: Long?, val beforeRun: (Int) -> Unit) {
+internal class Rig(
+    val worker: String,
+    val store: Store,
+    val card: Gpu?,
+    val gpuBytes: Long?,
+    val beforeRun: (Int) -> Unit,
+    val coordinator: (FromLot) -> Unit,
+) {
     val on: String = if (card == null) "cpu" else "gpu"
 }
 
@@ -103,7 +108,7 @@ private fun now(): Instant = clock.get().now().toKotlinInstant()
  */
 internal fun bench(rig: Rig): Behaviour<Work, Bench, Nothing> = behaviour(Bench()) { _, bench, work ->
     val told = work.told
-    told.from.tell(Begun(told.tag, told.lot, rig.worker))
+    rig.coordinator(Begun(told.tag, told.lot, rig.worker))
     val done = attempt<String, Pair<Bench, Took>> {
         when (told) {
             is Run -> run(rig, bench, told)
@@ -114,7 +119,7 @@ internal fun bench(rig: Rig): Behaviour<Work, Bench, Nothing> = behaviour(Bench(
         { why -> Failed(told.tag, told.lot, rig.worker, why) },
         { (_, took) -> Ran(told.tag, told.lot, rig.worker, told.id, rig.on, took.loading.seconds(), took.running.seconds()) },
     )
-    work.back.tell(Finished(told.tag, outcome, told.from, done.fold({ null }, { it.second.held })))
+    work.back.tell(Finished(told.tag, outcome, done.fold({ null }, { it.second.held })))
     done.fold({ stay() }, { (next, _) -> become(next) })
 }
 
