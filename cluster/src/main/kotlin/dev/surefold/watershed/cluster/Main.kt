@@ -193,7 +193,7 @@ context(_: Fail<Stopped>)
 private fun same(job: Job, outputsPer: Int, check: Path) {
     // Lot by lot, so that a big job's answers are never all in memory twice.
     val same = countNumbers(check).orStop() == job.scenarios * outputsPer && (0 until job.lots).all { lot ->
-        val count = job.count(lot) * outputsPer
+        val count = job.count(lot).toLong() * outputsPer
         val ours = readNumbers(job.answers(lot), 0, count).orStop()
         val theirs = readNumbers(check, job.first(lot) * outputsPer, count).orStop()
         ours.indices.all { ours[it].toRawBits() == theirs[it].toRawBits() }

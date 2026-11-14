@@ -101,24 +101,26 @@ internal class Book(val plan: Plan, val job: Job, val whole: List<Double>)
 
 /** Runs [test] with a book whose plan and scenarios are saved in a folder that is deleted after it. */
 internal fun withBook(test: (Book) -> Unit) = withTempDirectory("watershed-cluster") { folder: Path ->
-    Accounts.plan.save(folder.resolve("plan"))
+    engine { Accounts.plan.save(folder.resolve("plan")) }
     writeNumbers(folder.resolve("scenarios"), Accounts.scenarios).shouldBeRight()
     val job = Job.read("job", folder.resolve("plan"), folder.resolve("scenarios"), Accounts.plan.inputs, 100, folder.resolve("out"))
-    test(Book(Accounts.plan, job.shouldBeRight(), Accounts.plan.runCpu(Accounts.scenarios).asList()))
+    test(Book(Accounts.plan, job.shouldBeRight(), engine { Accounts.plan.runCpu(Accounts.scenarios) }.asList()))
 }
 
 // Eight accounts that grow at a rate and take a shock each period, and their total: built once for the suite.
 private object Accounts {
-    private val g = Graph()
-    private val rate = g.input("rate", 0.01)
-    private val shock = g.input("shock", 0.0)
-    private val worth: List<Node<Double>> = (0 until 8).map { n ->
-        (1 until 5).fold(g.define("v${n}_0", (rate + 1.0) * (100.0 + n))) { value, t ->
-            g.define("v${n}_$t", value * (rate + 1.0) - shock)
+    val plan: Plan = engine {
+        val g = Graph()
+        val rate = g.input("rate", 0.01)
+        val shock = g.input("shock", 0.0)
+        val worth: List<Node<Double>> = (0 until 8).map { n ->
+            (1 until 5).fold(g.define("v${n}_0", (rate + 1.0) * (100.0 + n))) { value, t ->
+                g.define("v${n}_$t", value * (rate + 1.0) - shock)
+            }
         }
+        val total = g.define("total", worth.drop(1).fold(worth[0] as Expr<Double>) { all, x -> all + x })
+        g.stabilize()
+        g.plan(vary = listOf(rate, shock), outputs = listOf(total, worth[3]))
     }
-    private val total = g.define("total", worth.drop(1).fold(worth[0] as Expr<Double>) { all, x -> all + x })
-
-    val plan: Plan = g.also { it.stabilize() }.plan(vary = listOf(rate, shock), outputs = listOf(total, worth[3]))
     val scenarios = DoubleArray(2_000) { if (it % 2 == 0) 0.0001 * it - 0.05 else 0.3 * (it % 7) }
 }

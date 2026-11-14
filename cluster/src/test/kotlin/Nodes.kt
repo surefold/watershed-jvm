@@ -13,6 +13,8 @@ import dev.surefold.cluster.Downing
 import dev.surefold.cluster.Gossiping
 import dev.surefold.cluster.Ready
 import dev.surefold.cluster.cluster
+import dev.surefold.fail.Fail
+import dev.surefold.fail.attempt
 import dev.surefold.junit.shouldBe
 import dev.surefold.resourceScope
 import dev.surefold.scope
@@ -21,11 +23,15 @@ import dev.surefold.watershed.cluster.Coordinator
 import dev.surefold.watershed.cluster.WORKER
 import dev.surefold.watershed.cluster.coordinator
 import dev.surefold.watershed.cluster.worker
+import dev.surefold.watershed.Refused
 import java.net.ServerSocket
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
+
+/** What [block] answers from the engine; the test fails if the engine refuses any of it. */
+internal fun <A> engine(block: Fail<Refused>.() -> A): A = attempt(block).shouldBeRight()
 
 /** Runs [test] with nodes it can start, in a scope of its own, and stops them all after it. */
 internal fun cluster(test: (Nodes) -> Unit) = scope {

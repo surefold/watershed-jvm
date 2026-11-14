@@ -20,15 +20,25 @@
 
 package watershed
 
-import dev.surefold.watershed.{Native, Wire}
+import dev.surefold.watershed.{Native, Refused, Wire}
 
+import dev.surefold.fail.{Either as Outcome, Fail}
 import scala.annotation.{implicitNotFound, targetName}
 import scala.jdk.CollectionConverters.*
 import scala.math.BigDecimal.RoundingMode
 
 /** Anything the engine refuses, with its reason. */
-type WatershedException = dev.surefold.watershed.WatershedException
-private def WatershedException(reason: String) = new dev.surefold.watershed.WatershedException(reason)
+final class WatershedException(reason: String) extends RuntimeException(reason)
+
+// The Kotlin core declares what the engine refuses as a failure of the calling scope. Scala has no such scope, so
+// here a refusal is thrown, as this layer has always done.
+private object Refusing extends Fail[Refused]:
+  def fail(error: Refused): Nothing = throw WatershedException(error.why)
+
+// An expression's steps, or the refusal of a value the engine cannot hold.
+private def written[A](steps: Outcome[Refused, A]): A = steps match
+  case refused: Outcome.Left[Refused @unchecked] => throw WatershedException(refused.getValue.why)
+  case made: Outcome.Right[A @unchecked]         => made.getValue
 
 /** What one update did. */
 final case class Report(update: Long, inputsChanged: Long, recalculated: Long, changed: Long)
@@ -44,38 +54,38 @@ sealed trait Holds[T]:
   private[watershed] def in(held: Any): T
   private[watershed] def set(graph: Long, node: Int, value: T): Unit
   private[watershed] def get(graph: Long, node: Int): T =
-    Native.value(graph, node) match
+    Native.value(Refusing, graph, node) match
       case failed: Native.Failed =>
-        throw WatershedException(s"${Native.name(graph, node)} could not be calculated: ${failed.why}")
+        throw WatershedException(s"${Native.name(Refusing, graph, node)} could not be calculated: ${failed.why}")
       case held => in(held)
 
 object Holds:
   given Holds[Double] with
     def out(value: Double) = Double.box(value)
     def in(held: Any) = held.asInstanceOf[java.lang.Double]
-    def set(graph: Long, node: Int, value: Double) = Native.setNumber(graph, node, value)
+    def set(graph: Long, node: Int, value: Double) = Native.setNumber(Refusing, graph, node, value)
     // A Double is read as a plain number, with nothing made on the way.
-    override def get(graph: Long, node: Int) = Native.number(graph, node)
+    override def get(graph: Long, node: Int) = Native.number(Refusing, graph, node)
 
   given Holds[Long] with
     def out(value: Long) = Long.box(value)
     def in(held: Any) = held.asInstanceOf[java.lang.Long]
-    def set(graph: Long, node: Int, value: Long) = Native.setWhole(graph, node, value)
+    def set(graph: Long, node: Int, value: Long) = Native.setWhole(Refusing, graph, node, value)
 
   given Holds[BigDecimal] with
     def out(value: BigDecimal) = value.bigDecimal
     def in(held: Any) = BigDecimal(held.asInstanceOf[java.math.BigDecimal])
-    def set(graph: Long, node: Int, value: BigDecimal) = Native.setDecimal(graph, node, value.bigDecimal)
+    def set(graph: Long, node: Int, value: BigDecimal) = Native.setDecimal(Refusing, graph, node, value.bigDecimal)
 
   given Holds[Boolean] with
     def out(value: Boolean) = Boolean.box(value)
     def in(held: Any) = held.asInstanceOf[java.lang.Boolean]
-    def set(graph: Long, node: Int, value: Boolean) = Native.setFlag(graph, node, value)
+    def set(graph: Long, node: Int, value: Boolean) = Native.setFlag(Refusing, graph, node, value)
 
   given Holds[String] with
     def out(value: String) = value
     def in(held: Any) = held.asInstanceOf[String]
-    def set(graph: Long, node: Int, value: String) = Native.setText(graph, node, value)
+    def set(graph: Long, node: Int, value: String) = Native.setText(Refusing, graph, node, value)
 
   given Holds[List[String]] with
     def out(value: List[String]) = throw WatershedException("an input cannot be a list")
@@ -137,7 +147,7 @@ final class Row private[watershed] (private[watershed] val key: String, private[
 def row(key: String, fields: FieldValue*): Row = Row(key, fields)
 
 private def constant[T](value: T)(using holds: Holds[T]): Expr[T] =
-  Expr(Wire.constant(holds.out(value)))
+  Expr(written(Wire.constant(holds.out(value))))
 
 private def unary[T](op: Byte, a: Expr[?]): Expr[T] =
   Expr(Wire.unary(op, a.steps))
@@ -280,16 +290,16 @@ final class Graph:
 
   /** Adds an input with a starting value. */
   def input[T](name: String, value: T)(using holds: Holds[T]): Input[T] =
-    Input(this, Native.input(address, name, holds.out(value)))
+    Input(this, Native.input(Refusing, address, name, holds.out(value)))
 
   /** Adds a calculated node. */
   def define[T](name: String, expression: Expr[T]): Node[T] =
-    Node(this, Native.define(address, name, expression.steps))
+    Node(this, Native.define(Refusing, address, name, expression.steps))
 
   /** Adds many calculated nodes in one call, in order. */
   def defineAll[T](definitions: Seq[(String, Expr[T])]): Seq[Node[T]] =
     Native
-      .defineMany(address, definitions.map(_._1).asJava, definitions.map(_._2.steps).asJava)
+      .defineMany(Refusing, address, definitions.map(_._1).asJava, definitions.map(_._2.steps).asJava)
       .toSeq
       .map(id => Node[T](this, id))
 
@@ -299,43 +309,43 @@ final class Graph:
 
   /** Sets many Double inputs in one call: the way to apply a batch of prices. */
   def setAll(values: Iterable[(Input[Double], Double)]): Unit =
-    Native.setNumbers(address, values.iterator.map(v => mine(v._1).id).toArray, values.iterator.map(_._2).toArray)
+    Native.setNumbers(Refusing, address, values.iterator.map(v => mine(v._1).id).toArray, values.iterator.map(_._2).toArray)
 
   /** The node's value as of the last update, `g(total)`. A node that could not be calculated throws, with why. */
   def apply[T](node: Node[T])(using holds: Holds[T]): T = holds.get(address, mine(node).id)
 
   /** The node's value, or None if it could not be calculated. */
   def get[T](node: Node[T])(using holds: Holds[T]): Option[T] =
-    Native.value(address, mine(node).id) match
+    Native.value(Refusing, address, mine(node).id) match
       case _: Native.Failed => None
       case held             => Some(holds.in(held))
 
   /** Applies every recorded change and recalculates what depends on them, and nothing else. */
   def stabilize(): Report =
-    val report = Native.stabilize(address)
+    val report = Native.stabilize(Refusing, address)
     Report(report.update, report.inputsChanged, report.recalculated, report.changed)
 
   /** Why the node has its value, as a tree of what it was worked out from. */
-  def explain(node: Node[?]): String = Native.explain(address, mine(node).id)
+  def explain(node: Node[?]): String = Native.explain(Refusing, address, mine(node).id)
 
   /** The names of the nodes the last update recalculated, in order. */
-  def lastRecalculated: List[String] = Native.lastRecalculated(address).asScala.toList
+  def lastRecalculated: List[String] = Native.lastRecalculated(Refusing, address).asScala.toList
 
   /** How many nodes the graph has had. */
   def size: Long = Native.size(address)
 
   /** Removes a node that nothing uses; its name is then free. */
-  def remove(node: Node[?]): Unit = Native.remove(address, mine(node).id)
+  def remove(node: Node[?]): Unit = Native.remove(Refusing, address, mine(node).id)
 
   /** Watches a node: in pull mode, it and what it uses are kept up to date. */
-  def watch(node: Node[?]): Unit = Native.watch(address, mine(node).id, true)
-  def unwatch(node: Node[?]): Unit = Native.watch(address, mine(node).id, false)
+  def watch(node: Node[?]): Unit = Native.watch(Refusing, address, mine(node).id, true)
+  def unwatch(node: Node[?]): Unit = Native.watch(Refusing, address, mine(node).id, false)
 
   /** Pull mode: while on, an update calculates only the watched nodes and what they use. */
-  def calculateOnlyWatched(on: Boolean): Unit = Native.calculateOnlyWatched(address, on)
+  def calculateOnlyWatched(on: Boolean): Unit = Native.calculateOnlyWatched(Refusing, address, on)
 
   /** Checks every node against a calculation from scratch. */
-  def checkConsistency(): Unit = Native.checkConsistency(address)
+  def checkConsistency(): Unit = Native.checkConsistency(Refusing, address)
 
   /** A new, empty keyed table of rows in this graph. */
   def collection(name: String): Collection = Collection(this, address, name)
@@ -345,10 +355,11 @@ final class Graph:
 /** A keyed table of rows, with fields, calculated columns and totals that update by only the rows that change. */
 final class Collection private[watershed] (graph: Graph, graphAddress: Long, name: String):
   // Holding `graph` keeps the graph alive for as long as this is.
-  private val address: Long = Native.collection(this, graphAddress, name)
+  private val address: Long = Native.collection(Refusing, graphAddress, name)
+  Native.ownCollection(this, address)
 
   private def field[T: Holds](name: String, kind: Byte): Field[T] =
-    Native.field(address, name, kind)
+    Native.field(Refusing, address, name, kind)
     Field(name)
 
   def number(name: String): Field[Double] = field(name, Wire.NUMBER)
@@ -359,36 +370,36 @@ final class Collection private[watershed] (graph: Graph, graphAddress: Long, nam
 
   /** Adds a column, worked out in every row from its fields, other columns and any node. */
   def column[T](name: String, expression: Expr[T]): Part[T] =
-    Native.column(address, name, expression.steps)
+    Native.column(Refusing, address, name, expression.steps)
     Part(name)
 
-  def sum[T: Number](name: String, of: Part[T]): Node[T] = Node(graph, Native.total(address, name, Wire.SUM, of.name))
-  def min[T: Number](name: String, of: Part[T]): Node[T] = Node(graph, Native.total(address, name, Wire.SMALLEST, of.name))
-  def max[T: Number](name: String, of: Part[T]): Node[T] = Node(graph, Native.total(address, name, Wire.LARGEST, of.name))
-  def count(name: String): Node[Long] = Node(graph, Native.total(address, name, Wire.COUNT, null))
+  def sum[T: Number](name: String, of: Part[T]): Node[T] = Node(graph, Native.total(Refusing, address, name, Wire.SUM, of.name))
+  def min[T: Number](name: String, of: Part[T]): Node[T] = Node(graph, Native.total(Refusing, address, name, Wire.SMALLEST, of.name))
+  def max[T: Number](name: String, of: Part[T]): Node[T] = Node(graph, Native.total(Refusing, address, name, Wire.LARGEST, of.name))
+  def count(name: String): Node[Long] = Node(graph, Native.total(Refusing, address, name, Wire.COUNT, null))
 
   private def write(to: Wire, key: String, fields: Seq[FieldValue]): Unit =
     to.put(key).put(fields.size)
-    fields.foreach(field => to.put(field.name).value(field.value))
+    fields.foreach(field => written(to.put(field.name).value(field.value)))
 
   /** Adds a row, or changes the fields given of one that is there: `orders.upsert("o-1", qty := 2.0)`. */
   def upsert(key: String, fields: FieldValue*): Unit =
     val wire = Wire()
     write(wire, key, fields)
-    Native.upsert(address, wire.bytes(), 1)
+    Native.upsert(Refusing, address, wire.bytes(), 1)
 
   /** Adds or changes many rows in one call: `orders.upsertAll(Seq(row("o-1", qty := 2.0), ...))`. */
   def upsertAll(rows: Iterable[Row]): Unit =
     val wire = Wire()
     rows.foreach(row => write(wire, row.key, row.fields))
-    Native.upsert(address, wire.bytes(), rows.size)
+    Native.upsert(Refusing, address, wire.bytes(), rows.size)
 
   /** Removes a row. Says whether there was one. */
-  def remove(key: String): Boolean = Native.removeRow(address, key)
+  def remove(key: String): Boolean = Native.removeRow(Refusing, address, key)
 
   /** A field or column of a row, as of the last update: `orders("o-1", line)`. */
   def apply[T](key: String, part: Part[T])(using holds: Holds[T]): T =
-    Native.rowValue(address, key, part.name) match
+    Native.rowValue(Refusing, address, key, part.name) match
       case failed: Native.Failed =>
         throw WatershedException(s"$key.${part.name} could not be calculated: ${failed.why}")
       case held => holds.in(held)

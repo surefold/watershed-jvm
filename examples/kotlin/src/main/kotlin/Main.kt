@@ -1,7 +1,15 @@
+import dev.surefold.fail.Fail
+import dev.surefold.fail.attempt
+import dev.surefold.fail.fold
 import dev.surefold.watershed.*
 import java.math.BigDecimal
 
-fun main() {
+// Nothing the engine does throws. A call it can refuse is made in a scope that declares it: `attempt` opens one
+// and answers how it ended, and a function with `context(_: Fail<Refused>)` takes the scope of whoever calls it.
+fun main() = attempt<Refused, Unit> { tour() }.fold({ println("refused: ${it.why}") }, {})
+
+context(_: Fail<Refused>)
+private fun tour() {
     // ---------------------------------------------------------------- a graph
     val g = Graph()
     val qty = g.input("qty", 10.0)          // Input<Double>
@@ -33,20 +41,16 @@ fun main() {
     // An update stops where a value comes out the same: qty 10 -> 12 leaves
     // shipping at 4.99, so nothing above shipping would be told.
     g[qty] = 12
-    var report = g.stabilize()
-    println("qty 10 -> 12: ${report.recalculated} recalculated, ${report.changed} changed")
+    val restocked = g.stabilize()
+    println("qty 10 -> 12: ${restocked.recalculated} recalculated, ${restocked.changed} changed")
     println("shipping = ${g[shipping]}, subtotal = ${g[subtotal]}")
     println()
 
     // A calculation that fails is a value the node holds, with its reason.
     val none = g.input("none", 0L)
     val share = g.define("share", 100L / none)
-    println("share = ${g.getOrNull(share)}")
-    try {
-        g[share]
-    } catch (e: WatershedException) {
-        println("refused: ${e.message}")
-    }
+    // Reading it is refused, and an `attempt` of its own keeps that refusal from ending the tour.
+    println("share: " + attempt<Refused, Long> { g[share] }.fold({ "refused: ${it.why}" }, { "$it" }))
     println()
 
     // ------------------------------------------------------------- decimals
@@ -80,15 +84,14 @@ fun main() {
     println("$rows rows: ${g.size()} nodes, revenue = ${g[revenue]}, rows = ${g[count]}")
 
     orders.upsert("o42", units(1000))
-    report = g.stabilize()
+    val report = g.stabilize()
     println(
         "one row changed: ${report.recalculated} nodes recalculated " +
             "(its line and two totals), largest = ${g[largest]}",
     )
 
     g[fx] = 1.3
-    report = g.stabilize()
-    println("the exchange rate changed: ${report.recalculated} nodes recalculated (every line)")
+    println("the exchange rate changed: ${g.stabilize().recalculated} nodes recalculated (every line)")
     println("row o42's line = ${orders["o42", line]}")
 
     g.checkConsistency()

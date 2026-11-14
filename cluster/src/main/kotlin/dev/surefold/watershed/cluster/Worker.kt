@@ -22,7 +22,7 @@ import dev.surefold.watershed.Gpu
 import dev.surefold.watershed.Held
 import dev.surefold.watershed.Patch
 import dev.surefold.watershed.Plan
-import dev.surefold.watershed.WatershedException
+import dev.surefold.watershed.Refused
 import java.nio.file.Path
 import java.time.Duration
 import java.time.Instant
@@ -85,8 +85,8 @@ fun Scope<*>.worker(
 // The GPU to run on, or none: asked for one outright, not finding it is a failure; left to choose, it is the CPU.
 private fun card(gpu: Boolean?): Either<NoGpu, Gpu?> = when (gpu) {
     false -> null.right()
-    true -> Either.catchOrThrow<WatershedException, Gpu> { Gpu() }.mapLeft { NoGpu(it.toString()) }
-    null -> Either.catchOrThrow<WatershedException, Gpu> { Gpu() }.fold({ null }, { it }).right()
+    true -> attempt<Refused, Gpu?> { Gpu.open() }.mapLeft { NoGpu(it.why) }
+    null -> attempt<Refused, Gpu?> { Gpu.open() }.fold({ null }, { it }).right()
 }
 
 // What the worker's actor gives its bench to do, and what the bench tells it back.
@@ -138,9 +138,9 @@ private fun bench(rig: Rig): Behaviour<Work, Bench, Nothing> = behaviour(Bench()
     done.fold({ stay() }, { (next, _) -> become(next) })
 }
 
-// The engine and java.nio throw for what they cannot do; here that is why a lot failed, told to the coordinator.
+// What the engine refuses is, here, why a lot failed, told to the coordinator.
 context(_: Fail<String>)
-private inline fun <A> engine(block: () -> A): A = Either.catch(block).mapLeft { it.toString() }.bind()
+private fun <A> engine(block: Fail<Refused>.() -> A): A = attempt(block).mapLeft { it.why }.bind()
 
 context(_: Fail<String>)
 private fun <A> Either<JobFailure.File, A>.read(): A = mapLeft { "${it.path}: ${it.why}" }.bind()
@@ -149,8 +149,7 @@ context(_: Fail<String>)
 private fun run(rig: Rig, bench: Bench, lot: Assign): Pair<Bench, Took> {
     val started = now()
     val plan = bench.plans[lot.plan] ?: engine { Plan.load(Path.of(lot.plan)) }
-    val count = engine { Math.multiplyExact(lot.count, plan.inputs) }
-    val inputs = readNumbers(Path.of(lot.inputs), lot.first * plan.inputs, count).read()
+    val inputs = readNumbers(Path.of(lot.inputs), lot.first * plan.inputs, lot.count.toLong() * plan.inputs).read()
     val loaded = now()
     rig.beforeRun(lot.lot)
     val running = now()
@@ -163,7 +162,7 @@ private fun run(rig: Rig, bench: Bench, lot: Assign): Pair<Bench, Took> {
     }
     val ran = now()
     val columns = lot.columns.toIntArray()
-    val holding = if (lot.hold) engine { Held(plan.inputs, inputs, answers) } else null
+    val holding = if (lot.hold) engine { Held.of(plan.inputs, inputs, answers) } else null
     val chosen = when {
         columns.isEmpty() -> answers
         holding != null -> engine { holding.values(columns) }

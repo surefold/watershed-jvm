@@ -151,7 +151,7 @@ class Coordinator internal constructor(
     /** Every scenario's answers, in order, once [job] has run: its lots' files put together. */
     fun answers(job: Job, outputsPerScenario: Int): Either<JobFailure, DoubleArray> =
         (0 until job.lots)
-            .traverse<JobFailure, Int, DoubleArray> { readNumbers(job.answers(it), 0, job.count(it) * outputsPerScenario).bind() }
+            .traverse<JobFailure, Int, DoubleArray> { readNumbers(job.answers(it), 0, job.count(it).toLong() * outputsPerScenario).bind() }
             .map { parts -> parts.flatMap(DoubleArray::asList).toDoubleArray() }
 }
 

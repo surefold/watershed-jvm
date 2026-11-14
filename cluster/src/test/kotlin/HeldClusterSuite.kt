@@ -100,23 +100,28 @@ private fun withLedger(test: (Ledger) -> Unit) = withTempDirectory("watershed-he
  */
 private class Ledger(private val folder: Path) {
     private val g = Graph()
-    private val rate = g.input("rate", 0.01)
-    private val shock = g.input("shock", 0.0)
-    private val floors: List<Input<Double>> = (0 until 20).map { n -> g.input("floor$n", 90.0 + n) }
-    private val groups: List<Node<Double>> = (0 until 5).map { a ->
-        val each = (0 until 4).map { b ->
-            val n = a * 4 + b
-            val value = (1 until 6).fold(g.define("v${n}_0", (rate + 1.0) * (100.0 + n))) { value, t ->
-                g.define("v${n}_$t", value * (rate + 1.0) - shock)
+    private val rate = engine { g.input("rate", 0.01) }
+    private val shock = engine { g.input("shock", 0.0) }
+    private val floors: List<Input<Double>> = engine { (0 until 20).map { n -> g.input("floor$n", 90.0 + n) } }
+    private val groups: List<Node<Double>> = engine {
+        (0 until 5).map { a ->
+            val each = (0 until 4).map { b ->
+                val n = a * 4 + b
+                val value = (1 until 6).fold(g.define("v${n}_0", (rate + 1.0) * (100.0 + n))) { value, t ->
+                    g.define("v${n}_$t", value * (rate + 1.0) - shock)
+                }
+                g.define("worth$n", value + floors[n] * shock)
             }
-            g.define("worth$n", value + floors[n] * shock)
+            g.define("group$a", each.drop(1).fold(each[0] as Expr<Double>) { all, x -> all + x })
         }
-        g.define("group$a", each.drop(1).fold(each[0] as Expr<Double>) { all, x -> all + x })
     }
-    private val total = g.define("total", groups.drop(1).fold(groups[0] as Expr<Double>) { all, x -> all + x })
+    private val total = engine { g.define("total", groups.drop(1).fold(groups[0] as Expr<Double>) { all, x -> all + x }) }
     private val scenarios = DoubleArray(2_000) { if (it % 2 == 0) 0.00002 * it - 0.03 else 0.01 * (it % 7) }
 
-    private fun kept(): Kept = g.also { it.stabilize() }.kept(vary = listOf(rate, shock), outputs = listOf(total), keep = groups)
+    private fun kept(): Kept = engine {
+        g.stabilize()
+        g.kept(vary = listOf(rate, shock), outputs = listOf(total), keep = groups)
+    }
 
     private val kept: Kept = kept()
 
@@ -127,7 +132,7 @@ private class Ledger(private val folder: Path) {
     fun jobNow(plan: String): Job = job(kept(), plan)
 
     private fun job(kept: Kept, plan: String): Job {
-        kept.plan.save(folder.resolve(plan))
+        engine { kept.plan.save(folder.resolve(plan)) }
         writeNumbers(folder.resolve("scenarios"), scenarios).shouldBeRight()
         return Job.read(
             "book", folder.resolve(plan), folder.resolve("scenarios"), 2, 100, folder.resolve("out"),
@@ -137,14 +142,14 @@ private class Ledger(private val folder: Path) {
 
     /** Changes [account]'s floor, and answers the file of the patch that brings what was kept up to date with it. */
     fun change(account: Int, floor: Double): Path {
-        g[floors[account]] = floor
-        g.stabilize()
-        return folder.resolve("patch-$account").also { kept().patch(listOf(floors[account])).shouldNotBeNull().save(it) }
+        engine { g[floors[account]] = floor }
+        val made = kept()
+        return folder.resolve("patch-$account").also { file -> engine { made.patch(listOf(floors[account])).shouldNotBeNull().save(file) } }
     }
 
     /** The total of every scenario, as the cluster's answers have it. */
     fun totals(coordinator: Coordinator, of: Job = job): List<Double> = coordinator.answers(of, 1).shouldBeRight().asList()
 
     /** What running every scenario again, with a plan made now, gives for the total. */
-    fun totalsNow(): List<Double> = g.plan(vary = listOf(rate, shock), outputs = listOf(total)).runCpu(scenarios).asList()
+    fun totalsNow(): List<Double> = engine { g.plan(vary = listOf(rate, shock), outputs = listOf(total)).runCpu(scenarios) }.asList()
 }

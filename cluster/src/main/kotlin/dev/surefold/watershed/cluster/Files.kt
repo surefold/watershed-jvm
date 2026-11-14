@@ -19,11 +19,12 @@ import java.nio.file.StandardOpenOption.WRITE
 // examples write. Surefold has no files of its own, so this is the one place that reaches for java.nio.
 
 /** [count] numbers of the file at [path], from the [first]. */
-fun readNumbers(path: Path, first: Long, count: Int): Either<JobFailure.File, DoubleArray> = attempt {
-    val bytes = ByteBuffer.allocate(Math.multiplyExact(count, 8)).order(ByteOrder.LITTLE_ENDIAN)
+fun readNumbers(path: Path, first: Long, count: Long): Either<JobFailure.File, DoubleArray> = attempt {
+    ensure(count in 0..Int.MAX_VALUE / 8) { JobFailure.File(path, "$count numbers are more than can be read at once") }
+    val bytes = ByteBuffer.allocate(count.toInt() * 8).order(ByteOrder.LITTLE_ENDIAN)
     val whole = filed(path) { FileChannel.open(path, READ).use { it.fill(bytes, first * 8) } }.bind()
     ensure(whole) { JobFailure.File(path, "it is too short: it has no number ${first + count - 1}") }
-    DoubleArray(count).also { bytes.flip().asDoubleBuffer().get(it) }
+    DoubleArray(count.toInt()).also { bytes.flip().asDoubleBuffer().get(it) }
 }
 
 /** How many numbers the file at [path] holds. */
@@ -34,7 +35,7 @@ fun countNumbers(path: Path): Either<JobFailure.File, Long> = filed(path) { File
  * lot that two workers ran is whichever finished last: the same numbers either way.
  */
 fun writeNumbers(path: Path, numbers: DoubleArray): Either<JobFailure.File, Unit> = filed(path) {
-    val bytes = ByteBuffer.allocate(Math.multiplyExact(numbers.size, 8)).order(ByteOrder.LITTLE_ENDIAN)
+    val bytes = ByteBuffer.allocate(numbers.size * Double.SIZE_BYTES).order(ByteOrder.LITTLE_ENDIAN)
     bytes.asDoubleBuffer().put(numbers)
     val part = Files.createTempFile(path.parent, "${path.fileName}.", ".part")
     FileChannel.open(part, WRITE).use { file ->

@@ -36,7 +36,7 @@ sbt exampleScala/run      # the same in Scala
 sbt benchmark             # times the engine's benchmark graph from Kotlin
 ```
 
-It needs Rust (`cargo`), a JDK from 22 up, and sbt. The engine's repository
+It needs Rust (`cargo`), JDK 25 and sbt. The engine's repository
 is private, so `git` on the machine must be able to fetch it.
 
 ## Typed, with nothing written as text
@@ -90,10 +90,34 @@ orders.upsertAll(listOf(row("o-2", units(1)), row("o-3", units(5))))
 
 ### When something goes wrong
 
+In Kotlin nothing throws. A call the engine can refuse (defining a node,
+setting an input, reading a value, running a plan) is made in a scope that
+declares the failure, using Surefold's `Fail`:
+
+```kotlin
+// attempt opens a scope and answers how it ended.
+val total: Either<Refused, Double> = attempt {
+    val g = Graph()
+    val qty = g.input("qty", 10.0)
+    val price = g.input("price", 2.5)
+    g[g.define("total", qty * price)]
+}
+
+// A function that calls the engine takes the scope of whoever calls it.
+context(_: Fail<Refused>)
+fun reprice(g: Graph, price: Input<Double>, to: Double) {
+    g[price] = to
+    g.stabilize()
+}
+```
+
 A node that could not be calculated (a division by zero, say) makes reading
-it throw a `WatershedException` with the reason; `g.getOrNull(node)` in
-Kotlin and `g.get(node)` in Scala give `null` or `None` instead. Anything
-the engine refuses is a `WatershedException` too.
+it a `Refused` with the reason, as is anything else the engine will not do.
+A scope costs nothing when nothing is refused: a set is 15 ns and a read
+10 ns in a loop of twenty million, the same as before the scope was there.
+
+In Scala a refusal is thrown as a `WatershedException`, and `g.get(node)`
+gives `None` for a node that could not be calculated.
 
 ## How fast
 
@@ -132,7 +156,7 @@ g.stabilize()
 
 val plan = g.plan(vary = listOf(rate), outputs = listOf(worth), shared = listOf(fee))
 val answers: DoubleArray = plan.runCpu(doubleArrayOf(0.01, 0.02, 0.03))   // one answer a scenario
-val onGpu = Gpu().run(plan, doubleArrayOf(0.01, 0.02, 0.03))               // needs a build with a GPU
+val onGpu = Gpu.open().run(plan, doubleArrayOf(0.01, 0.02, 0.03))               // needs a build with a GPU
 
 plan.save(Path.of("worth.plan"))             // for another process, or another machine
 val back = Plan.load(Path.of("worth.plan"))  // gives the same answers
@@ -254,8 +278,8 @@ time; what a worker holds is in its memory only, and is gone if it stops.
 
 ```
 native/    the engine as a C library (Rust): about thirty plain functions
-core/      one Java class, Native, that calls them, and Wire, which writes
-           the bytes that cross
+core/      Native, which calls them, and Wire, which writes the bytes that
+           cross: Kotlin, with what the engine refuses declared as a failure
 kotlin/    the typed layer for Kotlin, and its tests
 scala/     the typed layer for Scala 3, and its tests
 cluster/   a run's lots given to the workers of a Surefold Core cluster
@@ -266,8 +290,9 @@ examples/  a small program in each, and the benchmark
   `native/Cargo.toml`). To take a newer engine, move `rev` forward and run
   `sbt test`.
 - The JVM calls the C functions directly, through its foreign function API
-  (`java.lang.foreign`), which is why it needs JDK 22 or later and
-  `--enable-native-access`. Numbers cross in registers; a name, an
+  (`java.lang.foreign`), which is why it needs `--enable-native-access`.
+  It is built for JDK 25 because Surefold, which the failures are declared
+  with, is. Numbers cross in registers; a name, an
   expression or a batch of rows crosses as bytes.
 - All the unsafe Rust is in `native/src/ffi.rs`, and its first comment says
   what the JVM side must get right. A graph or collection is freed when its

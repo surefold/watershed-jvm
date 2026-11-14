@@ -47,39 +47,44 @@ val native = Seq(
   Test / test := (Test / test).dependsOn(ThisBuild / buildNative).value,
 )
 
-// The calls use the JDK's foreign function API, which is in JDK 22 and later.
-val jdk = Seq(javacOptions ++= Seq("--release", "22"))
+// Everything is built for Java 25: the calls use the JDK's foreign function API (JDK 22 and later), and Surefold,
+// which every failure here is declared with, is built for 25.
+val jdk = Seq(javacOptions ++= Seq("--release", "25"))
+
+val surefold = "0.18.1"
 
 val kotlinModule = Seq(
   kotlinVersion := kotlin,
-  kotlincJvmTarget := "22",
+  kotlincJvmTarget := "25",
   kotlinLib("stdlib"),
   // No Scala here.
   autoScalaLibrary := false,
   crossPaths := false,
 )
 
-// One Java class that calls the C library, and the bytes that cross to it.
+// The suites are surefold-junit's: each an object, found by Surefold's own JUnit Platform engine.
+val suites = Seq(
+  libraryDependencies ++= Seq(
+    "dev.surefold" % "surefold-junit" % surefold % Test,
+    "com.github.sbt.junit" % "jupiter-interface" % "0.19.0" % Test,
+  ),
+)
+
+// The engine's C functions, called from Kotlin, and the bytes that cross to it.
 lazy val core = (project in file("core"))
-  .settings(jdk)
+  .enablePlugins(KotlinPlugin)
+  .settings(jdk, kotlinModule)
   .settings(
     name := "watershed-core",
-    autoScalaLibrary := false,
-    crossPaths := false,
+    libraryDependencies += "dev.surefold" % "surefold" % surefold,
   )
 
 // What a Kotlin program uses.
 lazy val kotlinLayer = (project in file("kotlin"))
   .enablePlugins(KotlinPlugin)
   .dependsOn(core)
-  .settings(jdk, kotlinModule, native)
-  .settings(
-    name := "watershed-kotlin",
-    libraryDependencies ++= Seq(
-      "org.jetbrains.kotlin" % "kotlin-test-junit5" % kotlin % Test,
-      "com.github.sbt.junit" % "jupiter-interface" % "0.19.0" % Test,
-    ),
-  )
+  .settings(jdk, kotlinModule, native, suites)
+  .settings(name := "watershed-kotlin")
 
 // What a Scala program uses.
 lazy val scalaLayer = (project in file("scala"))
@@ -88,24 +93,21 @@ lazy val scalaLayer = (project in file("scala"))
   .settings(
     name := "watershed-scala",
     scalacOptions ++= Seq("-deprecation", "-feature", "-Werror"),
-    libraryDependencies += "org.scalameta" %% "munit" % "1.3.6" % Test,
+    libraryDependencies ++= Seq(
+      // The core declares its failures with Surefold's types, which this layer turns into its own exception.
+      "dev.surefold" % "surefold" % surefold,
+      "org.scalameta" %% "munit" % "1.3.6" % Test,
+    ),
   )
 
 // EXPERIMENTAL. A run of many scenarios cut into lots and given to the workers of a Surefold Core cluster.
 lazy val cluster = (project in file("cluster"))
   .enablePlugins(KotlinPlugin)
   .dependsOn(kotlinLayer)
-  .settings(jdk, kotlinModule, native)
+  .settings(jdk, kotlinModule, native, suites)
   .settings(
     name := "watershed-cluster",
-    // Surefold Core is built for Java 25, and its inline functions can only be inlined into code built for it too.
-    kotlincJvmTarget := "25",
-    libraryDependencies ++= Seq(
-      "dev.surefold" % "surefold-cluster" % "0.18.1",
-      // The tests are surefold-junit suites: each an object, found by Surefold's own JUnit Platform engine.
-      "dev.surefold" % "surefold-junit" % "0.18.1" % Test,
-      "com.github.sbt.junit" % "jupiter-interface" % "0.19.0" % Test,
-    ),
+    libraryDependencies += "dev.surefold" % "surefold-cluster" % surefold,
   )
 
 lazy val exampleKotlin = (project in file("examples/kotlin"))
@@ -114,6 +116,7 @@ lazy val exampleKotlin = (project in file("examples/kotlin"))
   .settings(jdk, kotlinModule, native)
   .settings(
     name := "watershed-example-kotlin",
+    libraryDependencies += "dev.surefold" % "surefold" % surefold,
     Compile / mainClass := Some("MainKt"),
     publish / skip := true,
   )
