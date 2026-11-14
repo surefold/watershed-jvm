@@ -1,5 +1,6 @@
 package dev.surefold.watershed.cluster
 
+import dev.surefold.Schedule
 import dev.surefold.Scope
 import dev.surefold.Shared
 import dev.surefold.actor.ActorRef
@@ -14,15 +15,19 @@ import dev.surefold.cluster.MemberEvent
 import dev.surefold.cluster.sharding
 import dev.surefold.cluster.singleton
 import dev.surefold.fail.Either
+import dev.surefold.fail.Fail
 import dev.surefold.fail.attempt
 import dev.surefold.fail.bind
 import dev.surefold.fail.ensure
+import dev.surefold.fail.fail
+import dev.surefold.fail.flatMap
 import dev.surefold.fail.fold
 import dev.surefold.fail.left
 import dev.surefold.fail.map
 import dev.surefold.fail.mapLeft
 import dev.surefold.fail.right
 import dev.surefold.fail.traverse
+import dev.surefold.retrying
 import dev.surefold.timeoutOrNull
 import dev.surefold.watershed.Gpu
 import dev.surefold.watershed.Refused
@@ -242,17 +247,23 @@ class Jobs internal constructor(
 
     private fun submitted(start: Start): Either<JobFailure, Report> {
         coordinator.tell(start)
-        // The coordinator ends a round itself when its time is up; this waits a little longer, in case it cannot say so.
-        return ended(start, now() + start.within + 30.seconds)
+        // Asked every so often until it has ended. The coordinator ends a round itself when its time is up; this
+        // gives up a little after that, in case it cannot say so.
+        val asking = Schedule.spaced<Waiting>(patience.askEvery) zipLeft Schedule.upTo(start.within + 30.seconds)
+        return asking.retrying { ended(start) }
+            .mapLeft { JobFailure.NoAnswer("the coordinator did not say how ${start.request} ended") }
+            .flatMap { it }
     }
 
-    private tailrec fun ended(start: Start, until: Instant): Either<JobFailure, Report> {
-        val standing = coordinator.ask<CoordinatorTurn, Standing>(10.seconds) { Progress(start.request, it) }
-        if (standing is Either.Right && standing.value is Standing.Ended) return (standing.value as Standing.Ended).how
-        if (now() > until) return JobFailure.NoAnswer("the coordinator did not say how ${start.request} ended").left()
+    // How the round ended, or a failure of this ask if it has not yet.
+    context(_: Fail<Waiting>)
+    private fun ended(start: Start): Either<JobFailure, Report> {
+        val standing = coordinator.ask<CoordinatorTurn, Standing>(10.seconds) { Progress(start.request, it) }.fold({ null }, { it })
         // A coordinator that does not know the round has only just taken over from the one that did.
-        if (standing is Either.Right && standing.value == Standing.Unknown) coordinator.tell(start)
-        clock.get().sleep(patience.askEvery)
-        return ended(start, until)
+        if (standing == Standing.Unknown) coordinator.tell(start)
+        return if (standing is Standing.Ended) standing.how else fail(Waiting)
     }
 }
+
+// The round has not ended yet: what an ask fails with, for the schedule to ask again.
+private data object Waiting

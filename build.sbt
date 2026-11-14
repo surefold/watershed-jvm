@@ -109,12 +109,18 @@ lazy val cluster = (project in file("cluster"))
     name := "watershed-cluster",
     libraryDependencies ++= Seq(
       "dev.surefold" % "surefold-cluster" % surefold,
+      // A node is a Surefold application: a graph built from configuration, its cluster joined as a section says.
+      "dev.surefold" % "surefold-app" % surefold,
+      "dev.surefold" % "surefold-app-actor" % surefold,
+      "dev.surefold" % "surefold-app-typesafe" % "0.18.0",
+      "dev.surefold" % "surefold-app-cluster" % "0.18.0",
       // A bucket every node reaches. Surefold's platform modules are published at 0.18.0, one behind its core.
       "dev.surefold" % "surefold-files" % "0.18.0",
       // Surefold's own test fixtures for nodes: a port nothing listens on, for a node a test starts.
       "dev.surefold" % "surefold-actor-remote" % surefold % Test classifier "test-fixtures",
     ),
-    dependencyOverrides += "dev.surefold" % "surefold" % surefold,
+    dependencyOverrides ++= Seq("surefold", "surefold-actor", "surefold-actor-remote", "surefold-cluster", "surefold-app", "surefold-app-actor")
+      .map("dev.surefold" % _ % surefold),
   )
 
 lazy val exampleKotlin = (project in file("examples/kotlin"))

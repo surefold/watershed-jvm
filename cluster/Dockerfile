@@ -41,4 +41,4 @@ COPY cluster/target/image/lib /opt/watershed/lib
 ENV PATH=/opt/java/bin:$PATH
 # The arguments are a node's: `worker name=… port=… seed=…` or `coordinator port=… plan=… …`.
 ENTRYPOINT ["java", "-cp", "/opt/watershed/lib/*", "--enable-native-access=ALL-UNNAMED", \
-  "-Dwatershed.library=/opt/watershed/libwatershed_jvm.so", "dev.surefold.watershed.cluster.MainKt"]
+  "-Dwatershed.library=/opt/watershed/libwatershed_jvm.so", "dev.surefold.watershed.cluster.AppKt"]

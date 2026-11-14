@@ -233,8 +233,23 @@ hung but not stopped, is given out again under another id, with every lot
 waiting behind it. A lot that fails is tried on other workers, and fails the
 job the third time.
 
-`cluster/run-local.sh` starts a coordinator, workers and an S3 server as
-separate processes on one machine; `cluster/image.sh` builds one container
+A node is a Surefold application: a graph of what it is made of, built from
+configuration and started and released by `runApp`. It joins the cluster as
+its `watershed.cluster` section says, through `surefold-app-cluster`, and is
+admitted once everything in it is built. `cluster/src/main/resources/reference.conf`
+has every setting; each is given in an `application.conf`, as a system
+property, or, for the bucket's keys and a few others, from the environment.
+
+```
+java -Dwatershed.cluster.roles.0=worker -Dwatershed.cluster.static.seeds.0=10.0.0.7:25520 ... AppKt worker
+java -Dwatershed.cluster.roles.0=coordinator -Dwatershed.job.plan=book/plan -Dwatershed.job.lot=1250 ... AppKt submit
+java -Dwatershed.put.from=worth.plan -Dwatershed.put.key=book/plan ... AppKt put
+```
+
+`worker` runs lots until it is stopped; `submit` runs the job in
+`watershed.job`, logs how it went and leaves; `put` copies a file of this
+machine into the bucket. `cluster/run-local.sh` starts them and an S3 server
+as separate processes on one machine; `cluster/image.sh` builds one container
 image for every node, which `cluster/run-containers.sh` runs as containers
 on a Docker network with the S3 server beside them.
 
