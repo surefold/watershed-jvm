@@ -98,6 +98,8 @@ lazy val cluster = (project in file("cluster"))
   .settings(jdk, kotlinModule, native)
   .settings(
     name := "watershed-cluster",
+    // Surefold Core is built for Java 25, and its inline functions can only be inlined into code built for it too.
+    kotlincJvmTarget := "25",
     libraryDependencies ++= Seq(
       "dev.surefold" % "surefold-cluster" % "0.18.1",
       "org.jetbrains.kotlin" % "kotlin-test-junit5" % kotlin % Test,

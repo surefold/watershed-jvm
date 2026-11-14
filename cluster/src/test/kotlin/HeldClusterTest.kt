@@ -72,7 +72,7 @@ class HeldClusterTest {
     @Test
     fun `a run held by several workers is brought up to date by a patch`() = withFolder { folder ->
         g.stabilize()
-        Nodes().use { nodes ->
+        nodes { nodes ->
             val coordinator = nodes.coordinator()
             repeat(3) { n -> nodes.start("worker-$n", setOf(WORKER)) { node, _ -> worker(node, gpu = false) } }
             assertTrue(coordinator.awaitWorkers(3, 30.seconds), "three workers joined")
@@ -98,7 +98,7 @@ class HeldClusterTest {
     @Test
     fun `lots whose worker has gone are reported lost and can be run again`() = withFolder { folder ->
         g.stabilize()
-        Nodes().use { nodes ->
+        nodes { nodes ->
             val coordinator = nodes.coordinator()
             repeat(2) { n -> nodes.start("worker-$n", setOf(WORKER)) { node, _ -> worker(node, gpu = false) } }
             val (_, stop) = nodes.start("worker-going", setOf(WORKER)) { node, _ -> worker(node, gpu = false) }

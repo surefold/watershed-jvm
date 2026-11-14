@@ -226,6 +226,12 @@ after one policy's promised amount changes, one run of each:
 | One GPU worker | 21.1 s | 0.41 s | the same to the last bit |
 | Two GPU workers sharing the card | 22.4 s | 0.37 s | the same |
 
+Both tables were measured before the coordinator and the worker were rewritten
+as actors. After the rewrite the same kinds of run gave the same answers, to
+the last bit, in about the same time: 16.3 s with one GPU worker, 20.3 s with
+two, and 0.24 s to bring a run held by two workers up to date (one run of
+each).
+
 The patch is 1 MB and works out 9,327 nodes for each path, of 19.9 million.
 A lot whose worker has gone since the first run cannot be brought up to
 date: it is left as it was and listed in the report, and

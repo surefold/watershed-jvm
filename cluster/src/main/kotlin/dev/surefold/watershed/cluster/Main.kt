@@ -1,5 +1,6 @@
 package dev.surefold.watershed.cluster
 
+import dev.surefold.Promise
 import dev.surefold.actor.remote.node
 import dev.surefold.cluster.Discovery
 import dev.surefold.cluster.Downing
@@ -8,7 +9,6 @@ import dev.surefold.cluster.cluster
 import dev.surefold.scope
 import java.nio.file.Files
 import java.nio.file.Path
-import java.util.concurrent.CountDownLatch
 import kotlin.system.exitProcess
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
@@ -60,7 +60,8 @@ fun main(args: Array<String>) {
             worker(node, gpu = set["gpu"]?.toBooleanStrict(), gpuBytes = set["gpu-bytes"]?.toLong())
             cluster.admit()
             println("worker ${node.self} is up")
-            CountDownLatch(1).await()
+            // A latch nobody opens: the worker goes on until its process is stopped.
+            Promise<Nothing, Unit>("watershed-worker").await()
         }
 
         "coordinator" -> {

@@ -1,3 +1,5 @@
+import dev.surefold.Deferred
+import dev.surefold.Promise
 import dev.surefold.Scope
 import dev.surefold.actor.remote.RemoteNode
 import dev.surefold.actor.remote.node
@@ -7,6 +9,7 @@ import dev.surefold.cluster.Downing
 import dev.surefold.cluster.Gossiping
 import dev.surefold.cluster.Ready
 import dev.surefold.cluster.cluster
+import dev.surefold.fail.Either
 import dev.surefold.scope
 import dev.surefold.watershed.Expr
 import dev.surefold.watershed.Graph
@@ -24,9 +27,6 @@ import dev.surefold.watershed.times
 import java.net.ServerSocket
 import java.nio.file.Files
 import java.nio.file.Path
-import java.util.concurrent.CompletableFuture
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 import kotlin.io.path.ExperimentalPathApi
 import kotlin.io.path.deleteRecursively
 import kotlin.test.Test
@@ -38,49 +38,62 @@ import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 
-/** Several nodes of one cluster in this JVM, each in a scope of its own on a thread of its own. */
-internal class Nodes : AutoCloseable {
+/**
+ * Several nodes of one cluster in this JVM. Each is a fork of the test's scope with a scope of its own inside, so
+ * that one can be stopped, and leave the cluster, while the others go on.
+ */
+internal class Nodes(private val test: Scope<Nothing>) {
     private val seed = free()
-    private val stops = ArrayList<Pair<CountDownLatch, Thread>>()
+    private val stops = ArrayList<() -> Unit>()
 
     private fun free(): Int = ServerSocket(0).use { it.localPort }
 
     /** Starts a node and gives back what [body] made on it, and a way to stop it. */
     fun <T> start(name: String, roles: Set<String>, first: Boolean = false, body: Scope<Nothing>.(RemoteNode, Cluster) -> T): Pair<T, () -> Unit> {
-        val made = CompletableFuture<T>()
-        val stop = CountDownLatch(1)
-        val thread = Thread.ofPlatform().name(name).start {
-            try {
-                scope {
-                    val node = node(name, if (first) seed else free())
-                    val cluster = cluster(
-                        node,
-                        Discovery.static("127.0.0.1:$seed"),
-                        gossiping = Gossiping(probeEvery = 200.milliseconds, ackWithin = 100.milliseconds, formAfter = 1.seconds),
-                        downing = Downing.keepMajority(stableAfter = 2.seconds),
-                        leaveWithin = 3.seconds,
-                        roles = roles,
-                        ready = Ready.WhenTold,
-                    )
-                    val result = body(node, cluster)
-                    cluster.admit()
-                    made.complete(result)
-                    stop.await()
-                }
-            } catch (thrown: Throwable) {
-                made.completeExceptionally(thrown)
+        val made = Promise<Nothing, T>("test-node-made")
+        val stop = Promise<Nothing, Unit>("test-node-stop")
+        val running = test.async {
+            scope {
+                val node = node(name, if (first) seed else free())
+                val cluster = cluster(
+                    node,
+                    Discovery.static("127.0.0.1:$seed"),
+                    gossiping = Gossiping(probeEvery = 200.milliseconds, ackWithin = 100.milliseconds, formAfter = 1.seconds),
+                    downing = Downing.keepMajority(stableAfter = 2.seconds),
+                    leaveWithin = 3.seconds,
+                    roles = roles,
+                    ready = Ready.WhenTold,
+                )
+                val result = body(node, cluster)
+                cluster.admit()
+                made.succeed(result)
+                stop.await()
             }
         }
-        stops += stop to thread
-        return made.get(30, TimeUnit.SECONDS) to {
-            stop.countDown()
-            thread.join(20_000)
+        val stopped = {
+            stop.succeed(Unit)
+            running.await()
+            Unit
         }
+        stops += stopped
+        // A node that throws before it is made ends its fork: waiting on the fork then throws what it threw.
+        val result = made.await(30.seconds) ?: running.await().let { error("$name was not made in 30 seconds") }
+        return (result as Either.Right).value to stopped
     }
 
-    override fun close() {
-        stops.forEach { it.first.countDown() }
-        stops.forEach { it.second.join(20_000) }
+    /** Runs [block] beside the test, as a fork of its scope. */
+    fun <T> fork(block: () -> T): Deferred<T> = test.async { block() }
+
+    fun stopAll() = stops.forEach { it() }
+}
+
+/** Runs [test] with nodes it can start, and stops them all after it. */
+internal fun nodes(test: (Nodes) -> Unit) = scope {
+    val nodes = Nodes(this)
+    try {
+        test(nodes)
+    } finally {
+        nodes.stopAll()
     }
 }
 
@@ -118,7 +131,7 @@ class ClusterTest {
 
     @Test
     fun `lots run by several workers give what one run gives`() = withJob { job, whole ->
-        Nodes().use { nodes ->
+        nodes { nodes ->
             val coordinator = nodes.coordinator()
             repeat(3) { n -> nodes.start("worker-$n", setOf(WORKER)) { node, _ -> worker(node, gpu = false) } }
             assertTrue(coordinator.awaitWorkers(3, 30.seconds), "three workers joined")
@@ -132,25 +145,25 @@ class ClusterTest {
 
     @Test
     fun `a lot whose worker leaves is run by another`() = withJob { job, whole ->
-        Nodes().use { nodes ->
+        nodes { nodes ->
             val coordinator = nodes.coordinator()
             repeat(2) { n -> nodes.start("worker-$n", setOf(WORKER)) { node, _ -> worker(node, gpu = false) } }
             // A worker that takes a lot and never finishes it.
-            val held = CountDownLatch(1)
-            val stuck = CountDownLatch(1)
+            val held = Promise<Nothing, Unit>("test-held")
+            val stuck = Promise<Nothing, Unit>("test-stuck")
             val (_, stop) = nodes.start("worker-stuck", setOf(WORKER)) { node, _ ->
                 worker(node, gpu = false, beforeRun = {
-                    held.countDown()
+                    held.succeed(Unit)
                     stuck.await()
                 })
             }
             assertTrue(coordinator.awaitWorkers(3, 30.seconds), "three workers joined")
 
-            val running = CompletableFuture.supplyAsync { coordinator.run(job, within = 2.minutes) }
-            assertTrue(held.await(30, TimeUnit.SECONDS), "the stuck worker was given a lot")
+            val running = nodes.fork { coordinator.run(job, within = 2.minutes) }
+            assertTrue(held.await(30.seconds) != null, "the stuck worker was given a lot")
             stop()
-            val report = running.get(2, TimeUnit.MINUTES)
-            stuck.countDown()
+            val report = running.await()
+            stuck.succeed(Unit)
 
             assertTrue(report.givenAgain >= 1, "its lot was given out again: $report")
             assertTrue(report.lots.none { it.worker.startsWith("worker-stuck") })
@@ -160,15 +173,15 @@ class ClusterTest {
 
     @Test
     fun `a lot that has been out too long is run by another`() = withJob { job, whole ->
-        Nodes().use { nodes ->
+        nodes { nodes ->
             val coordinator = nodes.coordinator(lotWithin = 2.seconds)
             nodes.start("worker-0", setOf(WORKER)) { node, _ -> worker(node, gpu = false) }
-            val stuck = CountDownLatch(1)
+            val stuck = Promise<Nothing, Unit>("test-stuck")
             nodes.start("worker-stuck", setOf(WORKER)) { node, _ -> worker(node, gpu = false, beforeRun = { stuck.await() }) }
             assertTrue(coordinator.awaitWorkers(2, 30.seconds), "two workers joined")
 
             val report = coordinator.run(job, within = 2.minutes)
-            stuck.countDown()
+            stuck.succeed(Unit)
             assertTrue(report.givenAgain >= 1, "its lot was given out again: $report")
             assertContentEquals(whole, coordinator.answers(job, plan.outputs))
         }
