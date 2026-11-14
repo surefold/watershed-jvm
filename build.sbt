@@ -107,7 +107,12 @@ lazy val cluster = (project in file("cluster"))
   .settings(jdk, kotlinModule, native, suites)
   .settings(
     name := "watershed-cluster",
-    libraryDependencies += "dev.surefold" % "surefold-cluster" % surefold,
+    libraryDependencies ++= Seq(
+      "dev.surefold" % "surefold-cluster" % surefold,
+      // A bucket every node reaches. Surefold's platform modules are published at 0.18.0, one behind its core.
+      "dev.surefold" % "surefold-files" % "0.18.0",
+    ),
+    dependencyOverrides += "dev.surefold" % "surefold" % surefold,
   )
 
 lazy val exampleKotlin = (project in file("examples/kotlin"))

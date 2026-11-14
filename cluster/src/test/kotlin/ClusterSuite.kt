@@ -3,7 +3,6 @@ import dev.surefold.assert.shouldBeRight
 import dev.surefold.awaitValue
 import dev.surefold.junit.Suite
 import dev.surefold.junit.shouldBe
-import dev.surefold.junit.shouldBeGreaterThan
 import dev.surefold.junit.shouldBeGreaterThanOrEqual
 import dev.surefold.junit.shouldHaveSize
 import dev.surefold.junit.story
@@ -13,7 +12,7 @@ import dev.surefold.watershed.Graph
 import dev.surefold.watershed.Node
 import dev.surefold.watershed.Plan
 import dev.surefold.watershed.cluster.Job
-import dev.surefold.watershed.cluster.writeNumbers
+import dev.surefold.watershed.cluster.Store
 import dev.surefold.watershed.minus
 import dev.surefold.watershed.plus
 import dev.surefold.watershed.times
@@ -24,71 +23,117 @@ import kotlin.time.Duration.Companion.seconds
 object ClusterSuite : Suite() {
     init {
         test("Lots run by several workers give what one run gives") {
-            withBook { book ->
-                cluster { nodes ->
-                    story {
-                        val coordinator = Given("a coordinator and three workers") {
-                            nodes.coordinator().also { nodes.workers(it, "worker-0", "worker-1", "worker-2") }
+            cluster { nodes ->
+                story {
+                    val book = book(nodes.store)
+                    val jobs = Given("a coordinator and three workers") {
+                        nodes.coordinator().also { nodes.workers(it, "worker-0", "worker-1", "worker-2") }
+                    }
+                    val report = When("it runs a job of ten lots") { jobs.run(book.job, within = 2.minutes).shouldBeRight() }
+                    Then("every lot is answered with what one run gives") {
+                        report.lots shouldHaveSize 10
+                        jobs.answers(book.job).shouldBeRight().asList() shouldBe book.whole
+                    }
+                    And("the lots are spread evenly: ten over three workers is three or four each") {
+                        report.lots.groupingBy { it.worker }.eachCount().values.sorted() shouldBe listOf(3, 3, 4)
+                    }
+                }
+            }
+        }
+
+        test("A job is submitted from any node, and the coordinator runs it") {
+            cluster { nodes ->
+                story {
+                    val book = book(nodes.store)
+                    val worker = Given("a coordinator and two workers") {
+                        nodes.coordinator().let { nodes.workers(it, "worker-0") }
+                        nodes.worker("worker-1").also { nodes.workers(it) }
+                    }
+                    val report = When("a worker submits the job") { worker.run(book.job, within = 2.minutes).shouldBeRight() }
+                    Then("every lot is answered with what one run gives") {
+                        report.lots shouldHaveSize 10
+                        worker.answers(book.job).shouldBeRight().asList() shouldBe book.whole
+                    }
+                }
+            }
+        }
+
+        test("A job goes on when the coordinator's node stops") {
+            cluster { nodes ->
+                story {
+                    val book = book(nodes.store)
+                    val taken = Promise<Nothing, Unit>("test.lot-taken")
+                    val release = Promise<Nothing, Unit>("test.lot-release")
+                    val worker = Given("a coordinator, a standby for it, and two workers, one held up on its first lot") {
+                        val first = nodes.coordinator()
+                        nodes.standby()
+                        nodes.worker("worker-held") {
+                            taken.succeed(Unit)
+                            release.awaitValue()
                         }
-                        val report = When("it runs a job of ten lots") {
-                            coordinator.run(book.job, within = 2.minutes).shouldBeRight()
-                        }
-                        Then("every lot is answered, by more than one worker, with what one run gives") {
-                            report.lots shouldHaveSize 10
-                            report.lots.map { it.worker }.distinct().size shouldBeGreaterThan 1
-                            coordinator.answers(book.job, book.plan.outputs).shouldBeRight().asList() shouldBe book.whole
-                        }
+                        nodes.workers(first, "worker-0")
+                        nodes.worker("worker-1").also { nodes.workers(it) }
+                    }
+                    val report = When("the coordinator's node stops while a job a worker submitted is running") {
+                        val running = nodes.beside { worker.run(book.job, within = 2.minutes) }
+                        taken.awaitValue(30.seconds) shouldBe Unit
+                        nodes.stop("coordinator")
+                        release.succeed(Unit)
+                        running.await().shouldBeRight()
+                    }
+                    Then("the standby finished it, and the answers are what one run gives") {
+                        report.lots shouldHaveSize 10
+                        worker.answers(book.job).shouldBeRight().asList() shouldBe book.whole
                     }
                 }
             }
         }
 
         test("A lot whose worker leaves is run by another") {
-            withBook { book ->
-                cluster { nodes ->
-                    story {
-                        val taken = Promise<Nothing, Unit>("test.lot-taken")
-                        val release = Promise<Nothing, Unit>("test.lot-release")
-                        val coordinator = Given("two workers, and a third that takes a lot and never finishes it") {
-                            nodes.coordinator().also {
-                                nodes.worker("worker-stuck") {
-                                    taken.succeed(Unit)
-                                    release.awaitValue()
-                                }
-                                nodes.workers(it, "worker-0", "worker-1")
+            cluster { nodes ->
+                story {
+                    val book = book(nodes.store)
+                    val taken = Promise<Nothing, Unit>("test.lot-taken")
+                    val release = Promise<Nothing, Unit>("test.lot-release")
+                    val jobs = Given("two workers, and a third that takes a lot and never finishes it") {
+                        nodes.coordinator().also {
+                            nodes.worker("worker-stuck") {
+                                taken.succeed(Unit)
+                                release.awaitValue()
                             }
+                            nodes.workers(it, "worker-0", "worker-1")
                         }
-                        val report = When("the third leaves the cluster while the job runs") {
-                            val running = nodes.beside { coordinator.run(book.job, within = 2.minutes) }
-                            taken.awaitValue(30.seconds) shouldBe Unit
-                            nodes.stop("worker-stuck")
-                            running.await().shouldBeRight()
-                        }
-                        Then("its lot was given to another, and the answers are what one run gives") {
-                            report.givenAgain shouldBeGreaterThanOrEqual 1
-                            report.lots.filter { it.worker.startsWith("worker-stuck") } shouldBe emptyList()
-                            coordinator.answers(book.job, book.plan.outputs).shouldBeRight().asList() shouldBe book.whole
-                        }
+                    }
+                    val report = When("the third leaves the cluster while the job runs") {
+                        val running = nodes.beside { jobs.run(book.job, within = 2.minutes) }
+                        taken.awaitValue(30.seconds) shouldBe Unit
+                        nodes.stop("worker-stuck")
+                        running.await().shouldBeRight()
+                    }
+                    Then("its lots were run by the others, and the answers are what one run gives") {
+                        report.lots shouldHaveSize 10
+                        report.lots.filter { it.worker.startsWith("worker-stuck") } shouldBe emptyList()
+                        jobs.answers(book.job).shouldBeRight().asList() shouldBe book.whole
                     }
                 }
             }
         }
 
-        test("A lot that has been out too long is run by another") {
-            withBook { book ->
-                cluster { nodes ->
-                    story {
-                        val coordinator = Given("a coordinator that waits two seconds for a lot, and a worker that hangs") {
-                            nodes.coordinator(lotWithin = 2.seconds).also {
-                                nodes.worker("worker-stuck") { Promise<Nothing, Unit>("test.never").awaitValue() }
-                                nodes.workers(it, "worker-0")
-                            }
+        test("A lot that has run too long is given out again") {
+            cluster(lotWithin = 2.seconds) { nodes ->
+                story {
+                    val book = book(nodes.store)
+                    val jobs = Given("a coordinator that allows a lot two seconds, and a worker that hangs") {
+                        nodes.coordinator().also {
+                            nodes.worker("worker-stuck") { Promise<Nothing, Unit>("test.never").awaitValue() }
+                            nodes.workers(it, "worker-0")
                         }
-                        val report = When("it runs the job") { coordinator.run(book.job, within = 2.minutes).shouldBeRight() }
-                        Then("the hung worker's lot was given to the other, and the answers are what one run gives") {
-                            report.givenAgain shouldBeGreaterThanOrEqual 1
-                            coordinator.answers(book.job, book.plan.outputs).shouldBeRight().asList() shouldBe book.whole
-                        }
+                    }
+                    val report = When("it runs the job") { jobs.run(book.job, within = 2.minutes).shouldBeRight() }
+                    Then("the hung worker's lots were given out again, and the answers are what one run gives") {
+                        report.givenAgain shouldBeGreaterThanOrEqual 1
+                        report.lots.filter { it.worker.startsWith("worker-stuck") } shouldBe emptyList()
+                        jobs.answers(book.job).shouldBeRight().asList() shouldBe book.whole
                     }
                 }
             }
@@ -96,15 +141,16 @@ object ClusterSuite : Suite() {
     }
 }
 
-/** A job of 1,000 scenarios in lots of 100, its files in a folder of its own, and what one run of them all gives. */
-internal class Book(val plan: Plan, val job: Job, val whole: List<Double>)
+/** A job of 1,000 scenarios in lots of 100, its files in the bucket, and what one run of them all gives. */
+internal class Book(val job: Job, val whole: List<Double>)
 
-/** Runs [test] with a book whose plan and scenarios are saved in a folder that is deleted after it. */
-internal fun withBook(test: (Book) -> Unit) = withTempDirectory("watershed-cluster") { folder: Path ->
+/** Puts the book's plan and scenarios in the bucket [store] is on, and answers the job over them. */
+internal fun book(store: Store): Book = withTempDirectory("watershed-book") { folder: Path ->
     engine { Accounts.plan.save(folder.resolve("plan")) }
-    writeNumbers(folder.resolve("scenarios"), Accounts.scenarios).shouldBeRight()
-    val job = Job.read("job", folder.resolve("plan"), folder.resolve("scenarios"), Accounts.plan.inputs, 100, folder.resolve("out"))
-    test(Book(Accounts.plan, job.shouldBeRight(), engine { Accounts.plan.runCpu(Accounts.scenarios) }.asList()))
+    store.put(folder.resolve("plan"), "book/plan").shouldBeRight()
+    store.write("book/scenarios", Accounts.scenarios).shouldBeRight()
+    val job = Job.read(store, "job", "book/plan", "book/scenarios", Accounts.plan.inputs, 100, "book/out").shouldBeRight()
+    Book(job, engine { Accounts.plan.runCpu(Accounts.scenarios) }.asList())
 }
 
 // Eight accounts that grow at a rate and take a shock each period, and their total: built once for the suite.

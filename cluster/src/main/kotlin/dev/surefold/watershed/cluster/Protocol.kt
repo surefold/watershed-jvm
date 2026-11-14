@@ -6,39 +6,44 @@ import dev.surefold.actor.remote.MessageCodec
 import dev.surefold.actor.remote.WireIn
 import dev.surefold.actor.remote.WireOut
 
-/** The role a node takes to be given lots. */
+/** The role of a node that runs lots. */
 const val WORKER = "worker"
 
-/** Where every worker's actor is, on its node. */
-const val WORKER_PATH = "/user/worker"
+/** The role of a node that may run the coordinator: the oldest of them does. */
+const val COORDINATOR = "coordinator"
 
-/** What a worker's actor handles: what it is told from elsewhere, and what it tells itself. */
-sealed interface WorkerTurn
+/** What a lot's entity handles: what the coordinator tells it, and what its own node tells it. */
+sealed interface LotTurn
 
-/** What a worker is told. */
-sealed interface ToWorker : WorkerTurn
-
-/** A lot to do something with. It carries a [tag], which the worker's answers carry back, and who to answer. */
-sealed interface Lot : ToWorker {
+/** What a lot is told. It carries a [tag], which its answers carry back, and who to answer. */
+sealed interface ToLot : LotTurn {
+    /** The lot's own id among the cluster's entities, which its answer carries back: whoever ran it holds it. */
+    val id: String
     val tag: String
     val lot: Int
-    val from: ActorRef<FromWorker>
+    val from: ActorRef<FromLot>
 }
 
-/** A message of a [kind] this node does not know: one from a newer version. It is noted, and nothing is done. */
-data class NotUnderstood(val kind: Int) : ToWorker, FromWorker {
-    override val tag: String get() = ""
-    override val lot: Int get() = -1
-    override val worker: String get() = ""
-}
+/** Something for a lot to do, which its node's bench does. */
+sealed interface Task : ToLot
 
 /**
- * One lot of a job's scenarios, for a worker to run: scenarios [first] to [first] + [count] of the file at
- * [inputs], with the plan at [plan], their answers to be written to [answers]. The files are named, not sent: a
- * plan is too big to cross as a message, so every node must be able to read and write the same folder.
+ * Which worker are you on? Asked of a lot's id before it is given anything to do, so that the coordinator can
+ * choose ids that spread a job's lots evenly: where an id lands is the cluster's choice, by a hash of the id.
  */
-data class Assign(
-    val job: String,
+data class Where(
+    override val id: String,
+    override val tag: String,
+    override val lot: Int,
+    override val from: ActorRef<FromLot>,
+) : ToLot
+
+/**
+ * Run this lot: scenarios [first] to [first] + [count] of the file at [inputs], with the plan at [plan], their
+ * answers written at [answers]. Each names a file in the bucket: a plan is too big to cross as a message.
+ */
+data class Run(
+    override val id: String,
     override val tag: String,
     override val lot: Int,
     val plan: String,
@@ -48,57 +53,76 @@ data class Assign(
     val answers: String,
     /** Which of the plan's outputs to write to [answers], in order; all of them if empty. */
     val columns: List<Int>,
-    /** Whether the worker is to hold on to the lot's inputs and every output, to be brought up to date later. */
+    /** Whether the lot is to hold on to its inputs and every output, to be brought up to date later. */
     val hold: Boolean,
-    override val from: ActorRef<FromWorker>,
-) : Lot
+    override val from: ActorRef<FromLot>,
+) : Task
 
-/** A lot the worker holds, to be brought up to date with the patch at [patch], and its [columns] written again. */
-data class Refresh(
-    val job: String,
+/** Bring what this lot holds up to date with the patch at [patch], and write its [columns] at [answers] again. */
+data class BringUpToDate(
+    override val id: String,
     override val tag: String,
     override val lot: Int,
     val patch: String,
     val answers: String,
     val columns: List<Int>,
-    override val from: ActorRef<FromWorker>,
-) : Lot
+    override val from: ActorRef<FromLot>,
+) : Task
 
-/** What the coordinator's actor handles: what workers tell it, and what this node tells it. */
+/** What the coordinator handles: what lots and whoever submits a job tell it, and what its own node tells it. */
 sealed interface CoordinatorTurn
 
-/** What a worker tells whoever gave it something to do. */
-sealed interface FromWorker : CoordinatorTurn {
+/** What a lot tells whoever gave it something to do, about [lot] of the round tagged [tag], from [worker]. */
+sealed interface FromLot : CoordinatorTurn {
     val tag: String
     val lot: Int
     val worker: String
 }
 
-/** What a worker says, at once, to being given a lot. */
-enum class Taking { Taken, Busy, NotHeld }
+/** The lot with the id [id] is on [worker]: the answer to [Where]. */
+data class At(override val tag: String, override val lot: Int, override val worker: String, val id: String) : FromLot
 
-data class Answer(override val tag: String, override val lot: Int, override val worker: String, val taking: Taking) : FromWorker
+/** The lot is in [worker]'s queue. */
+data class Queued(override val tag: String, override val lot: Int, override val worker: String) : FromLot
 
-/** A lot's answers are written. It ran [on] the worker's `gpu` or `cpu`. */
+/** [worker] has started on the lot; the time a lot is allowed runs from here. */
+data class Begun(override val tag: String, override val lot: Int, override val worker: String) : FromLot
+
+/** The lot's answers are written. It ran [on] the worker's `gpu` or `cpu`. */
 data class Ran(
     override val tag: String,
     override val lot: Int,
     override val worker: String,
+    /** The id of the lot that ran it, and now holds it if it was asked to. */
+    val id: String,
     val on: String,
     val loadSeconds: Double,
     val runSeconds: Double,
-) : FromWorker
+) : FromLot
 
-/** A lot could not be run, and [why]. */
-data class Failed(override val tag: String, override val lot: Int, override val worker: String, val why: String) : FromWorker
+/** The lot could not be done, and [why]. */
+data class Failed(override val tag: String, override val lot: Int, override val worker: String, val why: String) : FromLot
 
-object FromWorkerCodec : MessageCodec<FromWorker> {
-    override fun write(message: FromWorker, out: WireOut) {
+/** The lot was to be brought up to date, and holds nothing: it has moved to another worker since it ran, or never ran. */
+data class NotHeld(override val tag: String, override val lot: Int, override val worker: String) : FromLot
+
+/** A message of a [kind] this node does not know: one from a newer version. It is noted, and nothing is done. */
+data class NotUnderstood(val kind: Int) : LotTurn, FromLot {
+    override val tag: String get() = ""
+    override val lot: Int get() = -1
+    override val worker: String get() = ""
+}
+
+object FromLotCodec : MessageCodec<FromLot> {
+    override fun write(message: FromLot, out: WireOut) {
         out.int(
             when (message) {
-                is Answer -> 1
-                is Ran -> 2
-                is Failed -> 3
+                is Queued -> 1
+                is Begun -> 2
+                is Ran -> 3
+                is Failed -> 4
+                is NotHeld -> 5
+                is At -> 6
                 is NotUnderstood -> message.kind
             },
         )
@@ -106,39 +130,44 @@ object FromWorkerCodec : MessageCodec<FromWorker> {
         out.int(message.lot)
         out.string(message.worker)
         when (message) {
-            is Answer -> out.int(message.taking.ordinal)
             is Ran -> {
+                out.string(message.id)
                 out.string(message.on)
                 out.double(message.loadSeconds)
                 out.double(message.runSeconds)
             }
 
             is Failed -> out.string(message.why)
-            is NotUnderstood -> Unit
+            is At -> out.string(message.id)
+            is Queued, is Begun, is NotHeld, is NotUnderstood -> Unit
         }
     }
 
-    override fun read(input: WireIn): FromWorker {
+    override fun read(input: WireIn): FromLot {
         val kind = input.int()
         val tag = input.string()
         val lot = input.int()
         val worker = input.string()
         return when (kind) {
-            1 -> input.int().let { taking -> Taking.entries.getOrNull(taking)?.let { Answer(tag, lot, worker, it) } ?: NotUnderstood(kind) }
-            2 -> Ran(tag, lot, worker, input.string(), input.double(), input.double())
-            3 -> Failed(tag, lot, worker, input.string())
+            1 -> Queued(tag, lot, worker)
+            2 -> Begun(tag, lot, worker)
+            3 -> Ran(tag, lot, worker, input.string(), input.string(), input.double(), input.double())
+            4 -> Failed(tag, lot, worker, input.string())
+            5 -> NotHeld(tag, lot, worker)
+            6 -> At(tag, lot, worker, input.string())
             else -> NotUnderstood(kind)
         }
     }
 }
 
-object ToWorkerCodec : MessageCodec<ToWorker> {
+/** How a lot's messages cross between nodes. What a lot's own node tells it never crosses, and has no encoding. */
+object LotCodec : MessageCodec<LotTurn> {
     private val columns = Codecs.list(Codecs.int)
 
-    override fun write(message: ToWorker, out: WireOut) = when (message) {
-        is Assign -> {
+    override fun write(message: LotTurn, out: WireOut) = when (message) {
+        is Run -> {
             out.int(1)
-            out.string(message.job)
+            out.string(message.id)
             out.string(message.tag)
             out.int(message.lot)
             out.string(message.plan)
@@ -148,34 +177,40 @@ object ToWorkerCodec : MessageCodec<ToWorker> {
             out.string(message.answers)
             columns.write(message.columns, out)
             out.boolean(message.hold)
-            out.ref(message.from, FromWorkerCodec)
+            out.ref(message.from, FromLotCodec)
         }
 
-        is Refresh -> {
+        is BringUpToDate -> {
             out.int(2)
-            out.string(message.job)
+            out.string(message.id)
             out.string(message.tag)
             out.int(message.lot)
             out.string(message.patch)
             out.string(message.answers)
             columns.write(message.columns, out)
-            out.ref(message.from, FromWorkerCodec)
+            out.ref(message.from, FromLotCodec)
+        }
+
+        is Where -> {
+            out.int(3)
+            out.string(message.id)
+            out.string(message.tag)
+            out.int(message.lot)
+            out.ref(message.from, FromLotCodec)
         }
 
         is NotUnderstood -> out.int(message.kind)
+        is Finished -> out.int(0)
     }
 
-    override fun read(input: WireIn): ToWorker = when (val kind = input.int()) {
-        1 -> Assign(
+    override fun read(input: WireIn): LotTurn = when (val kind = input.int()) {
+        1 -> Run(
             input.string(), input.string(), input.int(), input.string(), input.string(), input.long(), input.int(),
-            input.string(), columns.read(input), input.boolean(), input.ref(FromWorkerCodec),
+            input.string(), columns.read(input), input.boolean(), input.ref(FromLotCodec),
         )
 
-        2 -> Refresh(
-            input.string(), input.string(), input.int(), input.string(), input.string(), columns.read(input),
-            input.ref(FromWorkerCodec),
-        )
-
+        2 -> BringUpToDate(input.string(), input.string(), input.int(), input.string(), input.string(), columns.read(input), input.ref(FromLotCodec))
+        3 -> Where(input.string(), input.string(), input.int(), input.ref(FromLotCodec))
         else -> NotUnderstood(kind)
     }
 }

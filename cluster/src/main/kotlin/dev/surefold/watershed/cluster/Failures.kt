@@ -1,6 +1,5 @@
 package dev.surefold.watershed.cluster
 
-import java.nio.file.Path
 import kotlin.time.Duration
 
 /** Why a job, or bringing one up to date, could not be finished. */
@@ -8,8 +7,8 @@ sealed interface JobFailure {
     /** The job's own description is wrong: its scenarios are not a whole number of them, or a lot holds none. */
     data class NotAJob(val why: String) : JobFailure
 
-    /** A file every node should be able to read or write could not be. */
-    data class File(val path: Path, val why: String) : JobFailure
+    /** A file in the bucket, or its copy on this machine, could not be read or written. */
+    data class File(val key: String, val why: String) : JobFailure
 
     /** One job runs at a time, and [running] has not ended. */
     data class Busy(val running: String) : JobFailure

@@ -184,110 +184,122 @@ the tests run a plan on it and check it against the CPU.
 
 ## A cluster (experimental)
 
-`cluster/` cuts a run of many scenarios into lots and gives them to the
-workers of a [Surefold Core](https://github.com/surefold/surefold-core)
-cluster. A coordinator keeps the lots not yet answered and gives one to each
-idle worker; a worker runs a lot on its GPU, or its CPU, and writes the
-answers to a file. A lot whose worker leaves, cannot be reached, fails or
-takes too long is given to another. Scenarios do not depend on one another,
-so the answers put together are the same, to the last bit, as one run of them
-all.
+`cluster/` cuts a run of many scenarios into lots and runs them on the nodes
+of a [Surefold](https://github.com/surefold/surefold-core) cluster. Scenarios
+do not depend on one another, so the answers put together are the same, to
+the last bit, as one run of them all. It is built from what Surefold's
+cluster already has:
 
-Plans are big (2 GB for a graph of 20 million nodes), so they do not cross
-between nodes: only "run scenarios 2,500 to 3,749 of this plan" does. Every
-node must be able to read the plan and the scenarios and write the answers
-under the same paths, which on one machine is a folder and across machines
-is a shared volume.
+- **A lot is a sharded entity.** It is an actor with an id, and the cluster
+  decides which worker runs it and moves it to another when that worker
+  goes. Nothing here assigns lots to workers. The coordinator asks where an
+  id would land before it uses it, and picks ids that spread a job's lots
+  evenly: ten lots over three workers is three, three and four.
+- **The coordinator is a singleton**: one actor in the cluster, on the oldest
+  node with the `coordinator` role. A job is submitted from any node. If the
+  coordinator's node stops, the next one takes over, whoever submitted the
+  job tells it to start again, and the lots that had already run say so
+  without running again.
+- **A worker runs one lot at a time**, on its GPU or its CPU, through one
+  actor on each node that every lot of that node queues behind.
+- **Files are in a bucket**, through `surefold-files`: any S3-compatible
+  store (AWS, Cloudflare R2, MinIO and the like). A plan is big (2 GB for a
+  graph of 20 million nodes), so it never crosses as a message: a lot is told
+  the plan's key, and its worker fetches it once. Nodes share nothing but the
+  bucket and the cluster, so they need no shared disk.
 
 ```kotlin
-// On each worker:
-val node = node("worker-1", 25520, host = "10.0.0.8")
+// On every node, after joining the cluster with the roles it is to have:
 val cluster = cluster(node, Discovery.static("10.0.0.7:25520"), roles = setOf(WORKER), ready = Ready.WhenTold)
-worker(node)                     // Either<NoGpu, Unit>
+val store = Store(S3Files.of(FilesConfig(bucket = "runs", region = "auto", accessKey = key, secretKey = secret, endpoint = r2)), localFolder)
+val jobs = jobs(cluster, store, working = Working()).bind()     // Either<NoGpu, Jobs>; working = null on a node that runs no lots
 cluster.admit()
 
-// On the coordinator:
-val coordinator = coordinator(node, cluster)
+// From any of them:
 val report: Either<JobFailure, Report> = attempt {
-    val job = Job.read("book", plan, scenarios, inputsPerScenario = 240, lot = 1_250, out = folder).bind()
-    coordinator.run(job).bind()
+    val job = Job.read(store, "book", plan = "book/plan", inputs = "book/paths", inputsPerScenario = 240, lot = 1_250, out = "book/out").bind()
+    jobs.run(job).bind()
 }
 ```
 
-Nothing in the cluster module throws for a job that cannot be finished: a
-bad job, a file that cannot be read, a lot that keeps failing and a run out
-of time are each a case of `JobFailure`, on the left of an `Either`.
+Nothing in it throws: a bad job, a file that cannot be read, a lot that keeps
+failing and a run out of time are each a case of `JobFailure`.
 
-`cluster/run-local.sh` starts a coordinator and workers as separate processes
-on one machine, and `cluster/image.sh` builds one container image for every
-node, which `cluster/run-containers.sh` runs as containers on a Docker
-network.
+A lot whose worker stops is run by another once the cluster has given up on
+that worker. A lot that runs longer than it is allowed, on a worker that has
+hung but not stopped, is given out again under another id, with every lot
+waiting behind it. A lot that fails is tried on other workers, and fails the
+job the third time.
 
-What has been tried, all on one machine with one RTX 3090, on the engine's
-insurance book (20,000 kinds of policy, 19.9 million nodes, 10,000 market
-paths, in lots of 1,250), one run of each:
-
-| | Time | Answers |
-|---|---|---|
-| One run in one process, no cluster | 11.6 s | the reference |
-| One GPU worker | 17.7 s, 6 s of it reading the plan | the same to the last bit |
-| Two GPU workers sharing the card | 23.5 s | the same |
-| Four GPU workers sharing the card | 22.4 s and 32.4 s (two runs) | the same |
-| Three GPU workers, one killed part way (lots of 625) | 21.8 s, one lot given out again | the same |
-| One GPU worker, built against CUDA 12.8 | 20.0 s | the same |
-
-Workers that share one card take turns on it, so more of them is no faster
-here: this shows that the answers are right and what the cluster costs, not
-a speed-up. **It has not been run on more than one machine, or on more than
-one GPU.** A small book (500 kinds of policy, 400 paths) gave the same
-answers from two GPU workers and a CPU worker together, and from CPU workers
-in three containers.
+`cluster/run-local.sh` starts a coordinator, workers and an S3 server as
+separate processes on one machine; `cluster/image.sh` builds one container
+image for every node, which `cluster/run-containers.sh` runs as containers
+on a Docker network with the S3 server beside them.
 
 ### Bringing a run up to date after a change
 
-A job can ask each worker to hold on to the lots it runs: every kept value
-of every scenario, in the worker's memory. When an input of the graph
-changes, the engine's `Kept` gives a patch, a small plan of what the change
-reaches, and `coordinator.refresh` has every worker run it on the lots it
-holds and write their answers again. Nothing is run again but that.
+A job can ask each lot to hold on to what it ran: every kept value of every
+scenario, in its worker's memory. When an input of the graph changes, the
+engine's `Kept` gives a patch, a small plan of what the change reaches, and
+`jobs.refresh` has every lot run it on what it holds and write its answers
+again. Nothing is run again but that. The patch reaches the right worker
+because it is told to the lot, by its id.
 
 ```kotlin
 val kept = g.kept(vary = paths, outputs = totals, keep = groupSums)
 kept.plan.save(planFile)
-val job = Job.read("book", planFile, scenarios, 240, 1_250, folder, columns = kept.outputColumns.toList(), hold = true).bind()
-coordinator.run(job).bind()
+store.put(planFile, "book/plan").bind()
+val job = Job.read(store, "book", "book/plan", "book/paths", 240, 1_250, "book/out", columns = kept.outputColumns.toList(), hold = true).bind()
+jobs.run(job).bind()
 
 g[promised] = 1.1 * was          // one policy changes
 g.stabilize()
 kept.patch(listOf(promised))?.save(patchFile)
-val report = coordinator.refresh(job, patchFile).bind()   // report.lost: lots whose worker has gone
+store.put(patchFile, "book/patch").bind()
+val report = jobs.refresh(job, "book/patch").bind()   // report.lost: lots whose worker has gone
 ```
 
-On the same insurance book, holding 11,436 values a path (915 MB in all),
-after one policy's promised amount changes, one run of each:
+A lot whose worker has gone since the first run holds nothing: it is left as
+it was and listed in the report, and `jobs.run(job, only = report.lost)`,
+with a plan made after the change, runs just those again. As with the
+engine's `Kept`, this helps only a change that reaches a small part of the
+model.
 
-| | First run | Brought up to date | Answers after |
-|---|---|---|---|
-| The engine alone, in one process | 11.2 s | 0.14 to 0.22 s | the reference |
-| One GPU worker | 21.1 s | 0.41 s | the same to the last bit |
-| Two GPU workers sharing the card | 22.4 s | 0.37 s | the same |
+### What has been tried
 
-Both tables were measured before the coordinator and the worker were rewritten
-as Surefold actors. After the rewrite the same kinds of run gave the same
-answers, to the last bit, in about the same time: 16.3 s with one GPU worker,
-21.1 s with two, and 0.24 s to bring a run held by two workers up to date
-(one run of each).
+All on one machine with one RTX 3090, with the S3 server on the same
+machine, on the engine's insurance book (20,000 kinds of policy, 19.9
+million nodes, 10,000 market paths), one run of each. Every run's answers
+were the same, to the last bit, as one run in one process.
 
-The patch is 1 MB and works out 9,327 nodes for each path, of 19.9 million.
-A lot whose worker has gone since the first run cannot be brought up to
-date: it is left as it was and listed in the report, and
-`coordinator.run(job, only = report.lost)`, with a plan made after the
-change, runs just those again. The tests do that. As with the engine's
-`Kept`, this helps only a change that reaches a small part of the model.
+| | Time |
+|---|---|
+| One run in one process, no cluster | 11.6 s |
+| Two GPU workers sharing the card, four lots | 24.6 s, 7 s of it each worker fetching and reading the plan |
+| Three GPU workers, one killed part way | 39.8 s, 10 s of it waiting for the cluster to give up on the worker |
+| A held run on two GPU workers | 27.4 s |
+| That run brought up to date after one policy changes | 0.39 s |
 
-Not done: a job is lost if the coordinator stops; the files must be on
-storage every node reaches, and nothing here copies them; one job runs at a
-time; what a worker holds is in its memory only, and is gone if it stops.
+Workers that share one card take turns on it, so more of them is no faster
+here: this shows that the answers are right and what the cluster costs, not
+a speed-up. **It has not been run on more than one machine, or on more than
+one GPU, or against a bucket over a real network.** A small book (500 kinds
+of policy, 400 paths) gave the same answers from CPU workers in three
+containers that shared only the bucket, held and brought up to date
+included.
+
+### What to know before relying on it
+
+- **A worker that joins takes some lots from the others.** That is how the
+  cluster's sharding places things. A job waits until the workers have been
+  the same for five seconds before it starts; a worker that joins while it
+  runs has some lots run again on it, and a held lot that moves is lost, as
+  if its worker had gone.
+- **A killed worker's lots wait for the cluster to give up on it** (ten
+  seconds as the command line sets it) before another runs them.
+- What a lot holds is in its worker's memory only.
+- One job runs at a time.
+- Lots are spread by count, not by how fast a worker is.
 
 ## How it fits together
 
@@ -297,7 +309,7 @@ core/      Native, which calls them, and Wire, which writes the bytes that
            cross: Kotlin, with what the engine refuses declared as a failure
 kotlin/    the typed layer for Kotlin, and its tests
 scala/     the typed layer for Scala 3, and its tests
-cluster/   a run's lots given to the workers of a Surefold Core cluster
+cluster/   a run cut into lots, on a Surefold cluster, its files in a bucket
 examples/  a small program in each, and the benchmark
 ```
 
@@ -323,7 +335,6 @@ examples/  a small program in each, and the benchmark
   outside this build needs the built library and
   `-Dwatershed.library.path`.
 - Tried on macOS (arm64) and Linux (x86-64, under WSL2).
-- Plans and the cluster from Scala.
 - In Kotlin, `Collection` shares a name with Kotlin's own, which wins when
   the type is written out: say `dev.surefold.watershed.Collection`, or let
   it be inferred.

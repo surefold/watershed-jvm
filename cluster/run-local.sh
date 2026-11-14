@@ -18,23 +18,37 @@ port=$(python3 -c 'import socket,random
 while True:
     p=random.randrange(20000,60000,256)
     try:
-        for q in list(range(p,p+17))+list(range(p+100,p+117)): socket.socket().bind(("127.0.0.1",q))
+        for q in list(range(p,p+17))+list(range(p+100,p+117))+[p+200]: socket.socket().bind(("127.0.0.1",q))
     except OSError: continue
     print(p); break')
 logs="$(mktemp -d)"
 pids=()
-trap 'kill "${pids[@]}" 2>/dev/null || true' EXIT
 
-# A folder the engine's `rerun` example wrote has more: which outputs are the answers, and a patch to bring the
-# run up to date with after it. The workers then hold their lots.
+# The bucket every node reaches: an S3 server of this run's own, in a container, stopped when the run ends. It is
+# RustFS, which speaks MinIO's API; MinIO no longer publishes an image. Its key is made up for this run.
+export WATERSHED_S3_ACCESS_KEY="watershed" WATERSHED_S3_SECRET_KEY="local-$RANDOM-$RANDOM-$RANDOM"
+s3=$(docker run -d --rm -p "127.0.0.1:$((port + 200)):9000" \
+  -e RUSTFS_ACCESS_KEY="$WATERSHED_S3_ACCESS_KEY" -e RUSTFS_SECRET_KEY="$WATERSHED_S3_SECRET_KEY" rustfs/rustfs:1.0.1)
+trap 'kill "${pids[@]}" 2>/dev/null || true; docker stop "$s3" >/dev/null 2>&1 || true' EXIT
+bucket=(bucket=watershed region=us-east-1 endpoint="http://127.0.0.1:$((port + 200))" path-style=true)
+until curl -sf "http://127.0.0.1:$((port + 200))/minio/health/live" >/dev/null; do sleep 0.2; done
+
+# The job's files go into the bucket. A folder the engine's `rerun` example wrote has more: which outputs are the
+# answers, and a patch to bring the run up to date with after it. The lots then hold what they ran.
+files=(plan paths whole)
 more=()
 if [ -f "$folder/patch" ]; then
-  more=(columns="$folder/columns" hold=true patch="$folder/patch" check-after="$folder/whole-after")
+  files+=(patch whole-after)
+  more=(columns="$(cat "$folder/columns")" hold=true patch=book/patch check-after=book/whole-after)
 fi
-rm -rf "$folder/out"
-"${run[@]}" coordinator port=$port plan="$folder/plan" inputs="$folder/paths" inputs-per=$inputs_per \
-  outputs-per=$outputs_per lot="$lot" out="$folder/out" workers=$((gpus + cpus)) check="$folder/whole" \
-  "${more[@]}" 2>"$logs/coordinator.log" &
+make=true
+for file in "${files[@]}"; do
+  "${run[@]}" put from="$folder/$file" key="book/$file" make-bucket=$make "${bucket[@]}" local="$logs/files-put" >>"$logs/put.log" 2>&1
+  make=false
+done
+"${run[@]}" coordinator port=$port plan=book/plan inputs=book/paths inputs-per=$inputs_per \
+  outputs-per=$outputs_per lot="$lot" out=book/out workers=$((gpus + cpus)) check=book/whole \
+  "${bucket[@]}" local="$logs/files-coordinator" "${more[@]}" 2>"$logs/coordinator.log" &
 coordinator=$!
 cores=$(nproc)
 # The GPU workers share the card: four fifths of what is free now, split between them.
@@ -44,13 +58,14 @@ if [ "$gpus" -gt 0 ]; then
 fi
 for n in $(seq 1 "$gpus"); do
   "${run[@]}" worker name="gpu-$n" port=$((port + n)) seed="127.0.0.1:$port" gpu=true gpu-bytes=$bytes \
-    >"$logs/gpu-$n.log" 2>&1 &
+    "${bucket[@]}" local="$logs/files-gpu-$n" >"$logs/gpu-$n.log" 2>&1 &
   pids+=($!)
 done
 for n in $(seq 1 "$cpus"); do
   # Left two cores short, so that a busy worker still answers the cluster.
   RAYON_NUM_THREADS=$(( (cores - 2) / (cpus > 0 ? cpus : 1) )) \
-    "${run[@]}" worker name="cpu-$n" port=$((port + 100 + n)) seed="127.0.0.1:$port" gpu=false >"$logs/cpu-$n.log" 2>&1 &
+    "${run[@]}" worker name="cpu-$n" port=$((port + 100 + n)) seed="127.0.0.1:$port" gpu=false \
+    "${bucket[@]}" local="$logs/files-cpu-$n" >"$logs/cpu-$n.log" 2>&1 &
   pids+=($!)
 done
 # Set KILL_AFTER to a number of seconds to kill the first worker outright that long after starting, as a crash.

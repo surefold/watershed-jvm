@@ -17,8 +17,10 @@ import dev.surefold.fail.ensureNotNull
 import dev.surefold.fail.fail
 import dev.surefold.fail.fold
 import dev.surefold.fail.mapLeft
+import dev.surefold.files.FilesConfig
+import dev.surefold.files.S3Files
 import dev.surefold.scope
-import java.nio.file.Files
+import java.net.URI
 import java.nio.file.Path
 import kotlin.system.exitProcess
 import kotlin.time.Duration
@@ -27,49 +29,61 @@ import kotlin.time.Duration.Companion.seconds
 
 private const val USAGE = """EXPERIMENTAL. One node of a cluster that runs a plan's scenarios in lots.
 
+  put          from=FILE key=KEY [make-bucket=true]
   worker       name=w1 port=25521 seed=HOST:PORT [host=127.0.0.1] [gpu=true|false] [gpu-bytes=N]
-  coordinator  port=25520 plan=FILE inputs=FILE inputs-per=N outputs-per=N lot=N out=FOLDER
-               [host=127.0.0.1] [workers=1] [wait=120] [lot-within=1800] [check=FILE] [job=job]
-               [columns=FILE] [hold=true] [patch=FILE] [check-after=FILE]
+  coordinator  port=25520 plan=KEY inputs=KEY inputs-per=N outputs-per=N lot=N out=PREFIX
+               [host=127.0.0.1] [workers=1] [wait=120] [lot-within=1800] [check=KEY] [job=job]
+               [columns=3,7] [hold=true] [patch=KEY] [check-after=KEY]
 
-columns= names a file of the plan's outputs to write as answers, as numbers with commas between. With hold=true
-each worker holds on to its lots, and patch= then brings them up to date with a patch from the engine's Kept.
+and, for every one of them, where the files are:
 
-Every node must be able to read the plan and the inputs, and write to the folder, under the same paths.
-The coordinator is the seed: start it first, and give its host and port to each worker. A worker runs lots on
-its GPU if it has one (pick which with CUDA_VISIBLE_DEVICES) unless gpu=false, and until it is stopped.
-Workers that share one GPU are each told how much of its memory to use, with gpu-bytes."""
+               bucket=NAME [region=auto] [endpoint=https://...] [path-style=true] [local=FOLDER]
+
+A job's files are in an S3-compatible bucket that every node reaches: its plan, its scenarios, each lot's answers.
+A KEY names a file there. `put` copies a file of this machine into the bucket, which is how a plan or a patch the
+engine saved gets there. The bucket's access key and secret are read from the environment, WATERSHED_S3_ACCESS_KEY
+and WATERSHED_S3_SECRET_KEY, not from the command line. local= is a folder for the copies a node fetches.
+
+columns= names the plan's outputs to write as answers. With hold=true each lot holds on to what it ran, and patch=
+then brings them up to date with a patch from the engine's Kept. check= and check-after= name files of the answers
+expected, to compare with, to the last bit.
+
+The coordinator's node is the seed: start it first, and give its host and port to each worker. A worker runs lots
+on its GPU if it has one (pick which with CUDA_VISIBLE_DEVICES) unless gpu=false, and until it is stopped. Workers
+that share one GPU are each told how much of its memory to use, with gpu-bytes."""
+
+// Why the node did not do what it was started for: said on the way out, with the exit code that goes with it.
+private data class Stopped(val why: String, val code: Int)
 
 // What the command line asks for, once every setting has been read: nothing below this asks for one again.
 private sealed interface Command {
-    val host: String
-    val port: Int
+    val store: Store
+
+    data class Put(override val store: Store, val from: Path, val key: String, val bucket: S3Files?) : Command
 
     data class Work(
-        override val host: String,
-        override val port: Int,
+        override val store: Store,
+        val host: String,
+        val port: Int,
         val name: String,
         val seed: String,
-        val gpu: Boolean?,
-        val gpuBytes: Long?,
+        val working: Working,
     ) : Command
 
     data class Coordinate(
-        override val host: String,
-        override val port: Int,
+        override val store: Store,
+        val host: String,
+        val port: Int,
         val job: Job,
         val outputsPer: Int,
         val workers: Int,
         val wait: Duration,
         val lotWithin: Duration,
-        val check: Path?,
-        val patch: Path?,
-        val checkAfter: Path?,
+        val check: String?,
+        val patch: String?,
+        val checkAfter: String?,
     ) : Command
 }
-
-// Why the node did not do what it was started for: said on the way out, with the exit code that goes with it.
-private data class Stopped(val why: String, val code: Int)
 
 private class Settings(args: List<String>) {
     private val set: Map<String, String> = args.mapNotNull { arg ->
@@ -99,35 +113,54 @@ private class Settings(args: List<String>) {
 }
 
 context(_: Fail<Stopped>)
-private fun command(args: Array<String>): Command {
+private fun store(set: Settings, environment: Map<String, String>): Store = bucket(set, environment).second
+
+// The bucket itself, for the one thing a store has no word for, making it; and the store on it.
+context(_: Fail<Stopped>)
+private fun bucket(set: Settings, environment: Map<String, String>): Pair<S3Files, Store> {
+    val config = FilesConfig(
+        bucket = set.need("bucket"),
+        region = set["region"] ?: "auto",
+        accessKey = ensureNotNull(environment["WATERSHED_S3_ACCESS_KEY"]) { Stopped("WATERSHED_S3_ACCESS_KEY is not set", 2) },
+        secretKey = ensureNotNull(environment["WATERSHED_S3_SECRET_KEY"]) { Stopped("WATERSHED_S3_SECRET_KEY is not set", 2) },
+        endpoint = set.read("endpoint", "an address") { text -> Either.catch { URI(text) }.fold({ null }, { it }) },
+        pathStyle = set.flag("path-style") ?: false,
+    )
+    return S3Files.of(config).let { it to Store(it, Path.of(set["local"] ?: "watershed-files")) }
+}
+
+context(_: Fail<Stopped>)
+private fun command(args: Array<String>, environment: Map<String, String>): Command {
     val set = Settings(args.drop(1))
-    ensure(set.stray.isEmpty()) { Stopped("${set.stray} is not name=value\n\n$USAGE", 2) }
+    ensure(args.isNotEmpty() && set.stray.isEmpty()) { Stopped(if (args.isEmpty()) USAGE else "${set.stray} is not name=value\n\n$USAGE", 2) }
     val host = set["host"] ?: "127.0.0.1"
-    return when (args.firstOrNull()) {
+    return when (args[0]) {
+        "put" -> bucket(set, environment).let { (bucket, store) ->
+            Command.Put(store, Path.of(set.need("from")), set.need("key"), bucket.takeIf { set.flag("make-bucket") == true })
+        }
         "worker" -> Command.Work(
-            host, set.needInt("port"), set.need("name"), set.need("seed"), set.flag("gpu"),
-            set.read("gpu-bytes", "a whole number", String::toLongOrNull),
+            store(set, environment), host, set.needInt("port"), set.need("name"), set.need("seed"),
+            Working(set.flag("gpu"), set.read("gpu-bytes", "a whole number", String::toLongOrNull)),
         )
 
         "coordinator" -> {
-            val columns = set["columns"]?.let { file ->
-                val text = Either.catch { Files.readString(Path.of(file)) }.mapLeft { Stopped("columns=$file: $it", 2) }.bind()
-                text.trim().split(",").map { ensureNotNull(it.trim().toIntOrNull()) { Stopped("columns=$file: $it is not a column", 2) } }
-            }
+            val store = store(set, environment)
+            val columns = set["columns"]?.split(",")?.map { ensureNotNull(it.trim().toIntOrNull()) { Stopped("columns=: $it is not a column", 2) } }
             val job = Job.read(
+                store,
                 set["job"] ?: "job",
-                Path.of(set.need("plan")),
-                Path.of(set.need("inputs")),
+                set.need("plan"),
+                set.need("inputs"),
                 set.needInt("inputs-per"),
                 set.needInt("lot"),
-                Path.of(set.need("out")),
+                set.need("out"),
                 columns.orEmpty(),
                 set.flag("hold") ?: false,
             ).mapLeft { Stopped(it.toString(), 2) }.bind()
             Command.Coordinate(
-                host, set.needInt("port"), job, set.needInt("outputs-per"), set.int("workers") ?: 1,
+                store, host, set.needInt("port"), job, set.needInt("outputs-per"), set.int("workers") ?: 1,
                 (set.int("wait") ?: 120).seconds, (set.int("lot-within") ?: 1800).seconds,
-                set["check"]?.let(Path::of), set["patch"]?.let(Path::of), set["check-after"]?.let(Path::of),
+                set["check"], set["patch"], set["check-after"],
             )
         }
 
@@ -140,7 +173,7 @@ private val downing = Downing.keepMajority(stableAfter = 10.seconds)
 
 private fun Scope<Stopped>.work(command: Command.Work) {
     val node = node(command.name, command.port, host = command.host)
-    // It joins, but is not counted a member that can be given lots until its worker is there to take them.
+    // It joins, but is not counted a member that can be given lots until it is ready to take them.
     val cluster = cluster(
         node,
         Discovery.static(command.seed),
@@ -149,7 +182,7 @@ private fun Scope<Stopped>.work(command: Command.Work) {
         roles = setOf(WORKER),
         ready = Ready.WhenTold,
     )
-    worker(node, gpu = command.gpu, gpuBytes = command.gpuBytes).mapLeft { Stopped("no GPU: ${it.why}", 1) }.bind()
+    jobs(cluster, command.store, command.working).mapLeft { Stopped("no GPU: ${it.why}", 1) }.bind()
     cluster.admit()
     println("worker ${node.self} is up")
     // A latch nobody opens: the worker goes on until its process is stopped.
@@ -159,29 +192,35 @@ private fun Scope<Stopped>.work(command: Command.Work) {
 private fun Scope<Stopped>.coordinate(command: Command.Coordinate) {
     val job = command.job
     val node = node("coordinator", command.port, host = command.host)
-    val cluster = cluster(node, Discovery.static("${command.host}:${command.port}"), downing = downing, leaveWithin = 5.seconds)
-    val coordinator = coordinator(node, cluster, lotWithin = command.lotWithin)
+    val cluster = cluster(
+        node,
+        Discovery.static("${command.host}:${command.port}"),
+        downing = downing,
+        leaveWithin = 5.seconds,
+        roles = setOf(COORDINATOR),
+        ready = Ready.WhenTold,
+    )
+    val jobs = jobs(cluster, command.store, patience = Patience(lotWithin = command.lotWithin)).mapLeft { Stopped(it.why, 1) }.bind()
+    cluster.admit()
     println("coordinator ${node.self}: ${job.scenarios} scenarios in ${job.lots} lots of ${job.lot}; waiting for ${command.workers} workers")
-    ensure(coordinator.awaitWorkers(command.workers, command.wait)) {
-        Stopped("only ${coordinator.workers()} of ${command.workers} workers joined", 1)
-    }
+    ensure(jobs.awaitWorkers(command.workers, command.wait)) { Stopped("only ${jobs.workers()} of ${command.workers} workers joined", 1) }
 
-    val report = coordinator.run(job, within = 600.minutes).orStop()
+    val report = jobs.run(job, within = 600.minutes).orStop()
     println("%5s  %-34s %4s %10s %10s".format("lot", "worker", "on", "loaded in", "ran in"))
     report.lots.forEach { println("%5d  %-34s %4s %9.1fs %9.1fs".format(it.lot, it.worker, it.on, it.loadSeconds, it.runSeconds)) }
     report.failures.forEach { println("failed and given to another: $it") }
     println("all ${job.lots} lots answered in ${report.took}; ${report.givenAgain} given out again")
-    command.check?.let { same(job, command.outputsPer, it) }
+    command.check?.let { same(command.store, job, command.outputsPer, it) }
 
     command.patch?.let { patch ->
-        val refreshed = coordinator.refresh(job, patch).orStop()
+        val refreshed = jobs.refresh(job, patch).orStop()
         println()
         println("brought up to date with $patch:")
         refreshed.lots.forEach { println("%5d  %-34s %4s %9.3fs %9.3fs".format(it.lot, it.worker, it.on, it.loadSeconds, it.runSeconds)) }
         refreshed.failures.forEach { println("failed: $it") }
         println("${refreshed.lots.size} lots brought up to date in ${refreshed.took}; lost: ${refreshed.lost}")
         ensure(refreshed.lost.isEmpty()) { Stopped("lots ${refreshed.lost} were lost", 1) }
-        command.checkAfter?.let { same(job, command.outputsPer, it) }
+        command.checkAfter?.let { same(command.store, job, command.outputsPer, it) }
     }
 }
 
@@ -190,13 +229,12 @@ private fun <A> Either<JobFailure, A>.orStop(): A = mapLeft { Stopped(it.toStrin
 
 // Stops unless the job's answers are, to the last bit, the numbers in the file at [check].
 context(_: Fail<Stopped>)
-private fun same(job: Job, outputsPer: Int, check: Path) {
+private fun same(store: Store, job: Job, outputsPer: Int, check: String) {
     // Lot by lot, so that a big job's answers are never all in memory twice.
-    val same = countNumbers(check).orStop() == job.scenarios * outputsPer && (0 until job.lots).all { lot ->
-        val count = job.count(lot).toLong() * outputsPer
-        val ours = readNumbers(job.answers(lot), 0, count).orStop()
-        val theirs = readNumbers(check, job.first(lot) * outputsPer, count).orStop()
-        ours.indices.all { ours[it].toRawBits() == theirs[it].toRawBits() }
+    val same = store.count(check).orStop() == job.scenarios * outputsPer && (0 until job.lots).all { lot ->
+        val ours = store.read(job.answers(lot)).orStop()
+        val theirs = store.read(check, job.first(lot) * outputsPer, job.count(lot).toLong() * outputsPer).orStop()
+        ours.size == theirs.size && ours.indices.all { ours[it].toRawBits() == theirs[it].toRawBits() }
     }
     ensure(same) { Stopped("THE ANSWERS DIFFER from $check", 1) }
     println("the answers are the same to the last bit as $check")
@@ -204,7 +242,12 @@ private fun same(job: Job, outputsPer: Int, check: Path) {
 
 fun main(args: Array<String>) {
     val ended = attempt<Stopped, Unit> {
-        when (val command = command(args)) {
+        when (val command = command(args, System.getenv())) {
+            is Command.Put -> {
+                command.bucket?.createBucket()?.mapLeft { Stopped("the bucket could not be made: $it", 1) }?.bind()
+                command.store.put(command.from, command.key).orStop()
+                println("${command.from} is at ${command.key}")
+            }
             is Command.Work -> scope { work(command) }
             is Command.Coordinate -> scope { coordinate(command) }
         }
