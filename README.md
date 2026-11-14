@@ -309,10 +309,31 @@ and 23.4 s with the clustered one, the same answers. So nothing gained in a
 single run: the clustered plan is a bigger file (2.4 GB against 2.0 GB) and
 each worker compiles its kernels once before its first lot.
 
+On one rented machine with eight A100s (40 GB), a worker in a container for
+each GPU and the files in a Cloudflare R2 bucket, 200,000 paths of the same
+book in 40 lots, one run of each but the last. Every run's answers were the
+same, to the last bit, as one run on the RTX 3090 (about 3 minutes):
+
+| GPUs | All lots answered in | Of which each worker fetching and reading the plan |
+|---|---|---|
+| 1 | 151 s | 36 s |
+| 2 | 150 s | 36 s and 91 s |
+| 4 | 74 s | 30 to 42 s |
+| 8 | 74 s and 71 s | 34 to 59 s |
+| 8, clustered plan | 92 s | 44 to 72 s |
+
+A lot of 5,000 paths took a worker 2.6 to 2.8 s, 102 to 113 s for all 40
+whatever the number of workers, so the calculating itself was shared out.
+But the job was too small to show it: eight GPUs do 13 s of calculating
+after each has spent 34 to 59 s on the plan, and that fetching is what is
+left. With two, one worker's fetch took 91 s and the other ran nearly every
+lot. The clustered plan was slower here: a bigger file, and kernels to
+compile in each worker, for lots that then take seconds. A job has to be
+much longer than a minute a worker before more workers pay.
+
 Workers that share one card take turns on it, so more of them is no faster
-here: this shows that the answers are right and what the cluster costs, not
-a speed-up. **It has not been run on more than one machine, or on more than
-one GPU, or against a bucket over a real network.** A small book (500 kinds
+on the desktop: this shows that the answers are right and what the cluster costs, not
+a speed-up. **It has not been run on more than one machine.** A small book (500 kinds
 of policy, 400 paths) gave the same answers from CPU workers in three
 containers that shared only the bucket, held and brought up to date
 included.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# EXPERIMENTAL, and not yet run: nothing here has had more than one GPU to try it on. A coordinator and one
+# EXPERIMENTAL. Run once, on one machine with eight A100s (see the README). A coordinator and one
 # worker for each GPU of this machine, as containers of the cluster's image on one Docker network, running a job
 # whose files are already in a bucket (put there by the `put` command, from wherever the plan was made).
 #
@@ -7,8 +7,8 @@
 #                         [INPUTS_PER=240] [OUTPUTS_PER=4]
 #
 # PREFIX is where the job's files are in the bucket: PREFIX/plan, PREFIX/paths and, to compare the answers with,
-# PREFIX/whole. The answers go to PREFIX/out. The bucket comes from the environment, and its keys from nowhere
-# else:
+# PREFIX/whole. The answers go to PREFIX/out. Set PLAN to use a plan that is somewhere else in the bucket, for
+# scenarios that share one. The bucket comes from the environment, and its keys from nowhere else:
 #
 #     WATERSHED_BUCKET, WATERSHED_S3_ENDPOINT, WATERSHED_S3_ACCESS_KEY, WATERSHED_S3_SECRET_KEY
 #
@@ -47,7 +47,7 @@ for n in $(seq 0 $((gpus - 1))); do
 done
 names+=("$net-coordinator")
 status=0
-node coordinator --name "$net-coordinator" -- cluster.roles.0=coordinator job.plan="$prefix/plan" \
+node coordinator --name "$net-coordinator" -- cluster.roles.0=coordinator job.plan="${PLAN:-$prefix/plan}" \
   job.inputs="$prefix/paths" job.inputs-per="$inputs_per" job.outputs-per="$outputs_per" job.lot="$lot" \
   job.out="$prefix/out" job.workers="$gpus" job.check="$prefix/whole" submit || status=$?
 # What each worker said, kept for after the containers are gone.
