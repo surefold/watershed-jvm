@@ -260,6 +260,15 @@ as separate processes on one machine; `cluster/image.sh` builds one container
 image for every node, which `cluster/run-containers.sh` runs as containers
 on a Docker network with the S3 server beside them.
 
+For a big job, `put` with `watershed.put.pack=true` packs a plan with zstd
+on the way (about a quarter of its size; a worker unpacks it as it fetches
+it), and with `watershed.put.piece-mb=16` puts the scenarios there in
+pieces, so that a worker fetches the pieces its lot is in and not the whole
+file. `get` copies a file out of the bucket to this machine, and a worker
+given `watershed.bucket.local` looks in that folder for a plan before the
+bucket: the workers of one machine then share one fetch. `cluster/run-gpus.sh`
+does all of that for a worker on each GPU of one machine.
+
 ### Bringing a run up to date after a change
 
 A job can ask each lot to hold on to what it ran: every kept value of every
@@ -310,9 +319,34 @@ single run: the clustered plan is a bigger file (2.4 GB against 2.0 GB) and
 each worker compiles its kernels once before its first lot.
 
 On one rented machine with eight A100s (40 GB), a worker in a container for
-each GPU and the files in a Cloudflare R2 bucket, 200,000 paths of the same
-book in 40 lots, one run of each but the last. Every run's answers were the
-same, to the last bit, as one run on the RTX 3090 (about 3 minutes):
+each GPU (`cluster/run-gpus.sh`) and the files in a Cloudflare R2 bucket.
+Every run's answers were the same, to the last bit, as one run in one
+process on the RTX 3090. One run of each but where two are given.
+
+2,000,000 paths of the same book in 80 lots of 25,000 (the 3090 took 31
+minutes), with the plan packed in the bucket and fetched once for the
+machine, and the scenarios there in pieces:
+
+| GPUs | All lots answered in | Against one |
+|---|---|---|
+| 1 | 1,126 s | |
+| 4 | 296 s | 3.8 times |
+| 8 | 163 s and 166 s | 6.9 and 6.8 times |
+| 8, each worker fetching the whole plan for itself | 195 s | |
+| 8, clustered plan | 70 s | 16 times, against one GPU on the plain plan |
+
+A lot took 12.0 s to work out with one GPU at it and 12.4 s with eight, so
+the cards do not get in each other's way. What is short of eight times is
+the start, and each lot's scenarios being fetched: 1.7 s a lot with one
+worker, 2.1 s with four, 2.4 to 3.2 s with eight. The one fetch of the plan
+for the machine is before the time starts and took 11 to 14 s (36 s for the
+clustered plan, once, and why was not found); with it, eight GPUs are 6.3
+times one. The clustered plan's lots took 3.9 s on average, a worker's first
+up to 24.5 s while its kernels were compiled. It was not run on one GPU, so
+its 16 times is not how it scales.
+
+Before that, 200,000 paths in 40 lots of 5,000, with each worker fetching
+the plan (2 GB, not packed) and all the scenarios for itself:
 
 | GPUs | All lots answered in | Of which each worker fetching and reading the plan |
 |---|---|---|
@@ -322,14 +356,12 @@ same, to the last bit, as one run on the RTX 3090 (about 3 minutes):
 | 8 | 74 s and 71 s | 34 to 59 s |
 | 8, clustered plan | 92 s | 44 to 72 s |
 
-A lot of 5,000 paths took a worker 2.6 to 2.8 s, 102 to 113 s for all 40
-whatever the number of workers, so the calculating itself was shared out.
-But the job was too small to show it: eight GPUs do 13 s of calculating
-after each has spent 34 to 59 s on the plan, and that fetching is what is
-left. With two, one worker's fetch took 91 s and the other ran nearly every
-lot. The clustered plan was slower here: a bigger file, and kernels to
-compile in each worker, for lots that then take seconds. A job has to be
-much longer than a minute a worker before more workers pay.
+That job was too small to show anything: its 40 lots are about 105 s of
+calculating however many workers there are, 13 s each for eight, after each
+has spent 34 to 59 s on the plan. A job has to be much longer than its
+start before more workers pay, which is what the packing, the one fetch for
+a machine and the pieces are for. A packed plan is 526 MB for 2,018 MB
+(571 MB for 2,411 MB clustered).
 
 Workers that share one card take turns on it, so more of them is no faster
 on the desktop: this shows that the answers are right and what the cluster costs, not

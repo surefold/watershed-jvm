@@ -46,9 +46,9 @@ shared=()
 if [ "${LOCAL:-1}" != 0 ]; then
   # Once for the machine: unpacked if it was packed, and read by every worker in place of a fetch each.
   cache="$(mktemp -d)"
-  started=$(date +%s.%N)
+  started=$(date +%s%N)
   node "fetch" --rm -v "$cache:/cache" -- get.key="$plan" get.to="/cache/$plan" get >/dev/null 2>&1
-  echo "the plan fetched once for the machine in $(echo "$(date +%s.%N) - $started" | bc | cut -c1-5) s"
+  echo "the plan fetched once for the machine in $(( ($(date +%s%N) - started) / 100000000 )) tenths of a second"
   shared=(-v "$cache:/cache:ro")
   settings+=(-Dwatershed.bucket.local=/cache)
 fi
