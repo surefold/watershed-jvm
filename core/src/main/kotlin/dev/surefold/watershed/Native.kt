@@ -8,7 +8,6 @@ import dev.surefold.fail.ensure
 import dev.surefold.fail.ensureNotNull
 import dev.surefold.fail.fold
 import dev.surefold.fail.mapLeft
-import java.io.File
 import java.lang.foreign.Arena
 import java.lang.foreign.FunctionDescriptor
 import java.lang.foreign.Linker
@@ -24,9 +23,9 @@ import java.lang.invoke.MethodHandle
 import java.lang.invoke.MethodHandles
 import java.lang.ref.Cleaner
 import java.math.BigDecimal
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import java.nio.file.Path
+import kotlin.io.path.Path
+import kotlin.io.path.isRegularFile
+import kotlin.io.path.pathString
 
 /**
  * The engine's C functions (see `src/ffi.rs`), called through the JDK's foreign function API. A call costs tens of
@@ -52,13 +51,13 @@ object Native {
     // The engine's library, opened once; or why it could not be. Nothing is called before this has been asked.
     private val opened: Either<Refused, SymbolLookup> = attempt {
         val name = System.mapLibraryName("watershed_jvm")
-        val folders = System.getProperty("watershed.library.path", "") + File.pathSeparator + System.getProperty("java.library.path", "")
-        val named = System.getProperty("watershed.library")?.let(Path::of)
-        val path = named ?: folders.split(File.pathSeparator).filter { it.isNotEmpty() }.map { File(it, name) }.firstOrNull { it.isFile }?.toPath()
-        ensureNotNull(path) {
+        val folders = System.getProperty("watershed.library.path", "") + System.getProperty("path.separator") + System.getProperty("java.library.path", "")
+        val file = System.getProperty("watershed.library")
+            ?: folders.split(System.getProperty("path.separator")).filter { it.isNotEmpty() }.map { Path(it, name) }.firstOrNull { it.isRegularFile() }?.pathString
+        ensureNotNull(file) {
             Refused("cannot find $name: set -Dwatershed.library.path to the folder it was built into (target/release)")
         }
-        Either.catch { SymbolLookup.libraryLookup(path, Arena.global()) }.mapLeft { Refused("cannot open $path: $it") }.bind()
+        Either.catch { SymbolLookup.libraryLookup(file, Arena.global()) }.mapLeft { Refused("cannot open $file: $it") }.bind()
     }
 
     /** Refused unless the engine's library was found and opened. Everything that makes a graph, a plan or a GPU asks. */
@@ -140,11 +139,17 @@ object Native {
         @JvmField val HELD_FREE = function("ws_held_free", null, JAVA_LONG)
         @JvmField val HELD_COLUMNS = function("ws_held_columns", JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG, ADDRESS, JAVA_LONG)
         @JvmField val HELD_REFRESH = function("ws_held_refresh", JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG)
-    }
 
-    // Room for what a call writes back (up to four numbers), per thread, so reading a value or running an update
-    // allocates nothing.
-    private val out: ThreadLocal<MemorySegment> = ThreadLocal.withInitial { Arena.global().allocate(JAVA_LONG, 4) }
+        @JvmField val SAVED_NEW = function("ws_saved_new", JAVA_LONG, JAVA_LONG)
+        @JvmField val SAVED_FREE = function("ws_saved_free", null, JAVA_LONG)
+        @JvmField val SAVED_SIZE = function("ws_saved_size", JAVA_LONG, JAVA_LONG)
+        @JvmField val SAVED_READ = function("ws_saved_read", JAVA_INT, JAVA_LONG, JAVA_LONG, ADDRESS, JAVA_LONG)
+        @JvmField val SAVED_WRITE = function("ws_saved_write", JAVA_INT, JAVA_LONG, JAVA_LONG, ADDRESS, JAVA_LONG)
+        @JvmField val PLAN_SAVED = function("ws_plan_saved", JAVA_LONG, JAVA_LONG)
+        @JvmField val PLAN_OF_SAVED = function("ws_plan_of_saved", JAVA_LONG, JAVA_LONG)
+        @JvmField val PATCH_SAVED = function("ws_patch_saved", JAVA_LONG, JAVA_LONG)
+        @JvmField val PATCH_OF_SAVED = function("ws_patch_of_saved", JAVA_LONG, JAVA_LONG)
+    }
 
     private const val DONE = 0
 
@@ -188,9 +193,16 @@ object Native {
     context(fail: Fail<Refused>)
     private fun text(length: Long): String = if (length < 0) fail.fail(refused()) else String(kept(Calls.RESULT))
 
+    // A whole number as the engine writes it: four bytes, least significant first.
+    private fun ByteArray.int(at: Int): Int = (0 until 4).fold(0) { whole, byte -> whole or ((this[at + byte].toInt() and 0xff) shl (8 * byte)) }
+
+    // The engine's list of texts: how many, then each as its length and its bytes.
     private fun texts(): List<String> {
-        val bytes = ByteBuffer.wrap(kept(Calls.RESULT)).order(ByteOrder.LITTLE_ENDIAN)
-        return List(bytes.getInt()) { String(ByteArray(bytes.getInt()).also(bytes::get)) }
+        val bytes = kept(Calls.RESULT)
+        return (0 until bytes.int(0)).runningFold(4 to "") { (at, _), _ ->
+            val length = bytes.int(at)
+            (at + 4 + length) to bytes.decodeToString(at + 4, at + 4 + length)
+        }.drop(1).map { it.second }
     }
 
     /** A value the engine wrote to [out]: a Double, Long, BigDecimal, Boolean, String, list of Strings, or [Failed]. */
@@ -339,18 +351,18 @@ object Native {
     /** A node's value as of the last update, or a [Failed] if it could not be calculated. */
     context(_: Fail<Refused>)
     @JvmStatic
-    fun value(graph: Long, node: Int): Any {
-        val out = out.get()
-        return read(Calls.VALUE.invokeExact(graph, node, out) as Int, out)
+    fun value(graph: Long, node: Int): Any = Arena.ofConfined().use { arena ->
+        val out = arena.allocate(JAVA_LONG, 4)
+        read(Calls.VALUE.invokeExact(graph, node, out) as Int, out)
     }
 
     /** Applies every recorded change and recalculates what depends on them, and nothing else. */
     context(_: Fail<Refused>)
     @JvmStatic
-    fun stabilize(graph: Long): Report {
-        val out = out.get()
+    fun stabilize(graph: Long): Report = Arena.ofConfined().use { arena ->
+        val out = arena.allocate(JAVA_LONG, 4)
         done(Calls.STABILIZE.invokeExact(graph, out) as Int)
-        return Report(out.getAtIndex(JAVA_LONG, 0), out.getAtIndex(JAVA_LONG, 1), out.getAtIndex(JAVA_LONG, 2), out.getAtIndex(JAVA_LONG, 3))
+        Report(out.getAtIndex(JAVA_LONG, 0), out.getAtIndex(JAVA_LONG, 1), out.getAtIndex(JAVA_LONG, 2), out.getAtIndex(JAVA_LONG, 3))
     }
 
     context(_: Fail<Refused>)
@@ -442,7 +454,7 @@ object Native {
     context(_: Fail<Refused>)
     @JvmStatic
     fun rowValue(collection: Long, key: String, part: String): Any = Arena.ofConfined().use { arena ->
-        val out = out.get()
+        val out = arena.allocate(JAVA_LONG, 4)
         val keyed = key.toByteArray()
         val named = part.toByteArray()
         read(Calls.ROW_VALUE.invokeExact(collection, bytes(arena, keyed), keyed.size.toLong(), bytes(arena, named), named.size.toLong(), out) as Int, out)
@@ -574,8 +586,8 @@ object Native {
     @JvmStatic
     fun keptColumns(kept: Long): IntArray {
         if ((Calls.KEPT_COLUMNS.invokeExact(kept) as Long) < 0) fail.fail(refused())
-        val bytes = ByteBuffer.wrap(kept(Calls.RESULT)).order(ByteOrder.LITTLE_ENDIAN)
-        return IntArray(bytes.remaining() / Int.SIZE_BYTES).also { bytes.asIntBuffer().get(it) }
+        val bytes = kept(Calls.RESULT)
+        return IntArray(bytes.size / Int.SIZE_BYTES) { bytes.int(it * Int.SIZE_BYTES) }
     }
 
     /**
@@ -648,4 +660,61 @@ object Native {
     context(_: Fail<Refused>)
     @JvmStatic
     fun heldRefresh(held: Long, patch: Long, gpu: Long, allowed: Long) = done(Calls.HELD_REFRESH.invokeExact(held, patch, gpu, allowed) as Int)
+
+    // ------------------------------------------- plans and patches as bytes
+
+    /** Room in the engine for [size] bytes, to write a plan or a patch into a part at a time. Give it to [ownSaved]. */
+    context(_: Fail<Refused>)
+    @JvmStatic
+    fun saved(size: Long): Long {
+        ready()
+        return address(Calls.SAVED_NEW.invokeExact(size) as Long)
+    }
+
+    /** Has the bytes freed once nothing can reach [owner]. */
+    @JvmStatic
+    fun ownSaved(owner: Any, address: Long) = freeWith(owner, Calls.SAVED_FREE, address)
+
+    /** How many bytes there are. */
+    context(fail: Fail<Refused>)
+    @JvmStatic
+    fun savedSize(saved: Long): Long = (Calls.SAVED_SIZE.invokeExact(saved) as Long).let { if (it < 0) fail.fail(refused()) else it }
+
+    /** [count] of the bytes, from the one at [from]. */
+    context(_: Fail<Refused>)
+    @JvmStatic
+    fun savedRead(saved: Long, from: Long, count: Int): ByteArray = Arena.ofConfined().use { arena ->
+        val out = arena.allocate(maxOf(count, 1).toLong())
+        done(Calls.SAVED_READ.invokeExact(saved, from, out, count.toLong()) as Int)
+        out.asSlice(0, count.toLong()).toArray(JAVA_BYTE)
+    }
+
+    /** Puts the first [count] of [bytes] at the place [from]. */
+    context(_: Fail<Refused>)
+    @JvmStatic
+    fun savedWrite(saved: Long, from: Long, bytes: ByteArray, count: Int) = Arena.ofConfined().use { arena ->
+        val part = arena.allocate(maxOf(count, 1).toLong())
+        MemorySegment.copy(bytes, 0, part, JAVA_BYTE, 0, count)
+        done(Calls.SAVED_WRITE.invokeExact(saved, from, part, count.toLong()) as Int)
+    }
+
+    /** A plan as bytes. Give them to [ownSaved]. */
+    context(_: Fail<Refused>)
+    @JvmStatic
+    fun planSaved(plan: Long): Long = address(Calls.PLAN_SAVED.invokeExact(plan) as Long)
+
+    /** A plan from bytes. Give it to [ownPlan]. */
+    context(_: Fail<Refused>)
+    @JvmStatic
+    fun planOfSaved(saved: Long): Long = address(Calls.PLAN_OF_SAVED.invokeExact(saved) as Long)
+
+    /** A patch as bytes. Give them to [ownSaved]. */
+    context(_: Fail<Refused>)
+    @JvmStatic
+    fun patchSaved(patch: Long): Long = address(Calls.PATCH_SAVED.invokeExact(patch) as Long)
+
+    /** A patch from bytes. Give it to [ownPatch]. */
+    context(_: Fail<Refused>)
+    @JvmStatic
+    fun patchOfSaved(saved: Long): Long = address(Calls.PATCH_OF_SAVED.invokeExact(saved) as Long)
 }

@@ -16,10 +16,12 @@ import dev.surefold.watershed.Node
 import dev.surefold.watershed.Patch
 import dev.surefold.watershed.Plan
 import dev.surefold.watershed.Refused
+import dev.surefold.watershed.Saved
 import dev.surefold.watershed.minus
 import dev.surefold.watershed.plus
 import dev.surefold.watershed.times
-import java.nio.file.Files
+import kotlin.io.path.pathString
+import kotlin.io.path.writeText
 
 object PlansSuite : Suite() {
     init {
@@ -45,8 +47,8 @@ object PlansSuite : Suite() {
                 engine {
                     val plan = model().plan()
                     plan.setShared(doubleArrayOf(0.004))
-                    plan.save(folder.resolve("plan"))
-                    val back = Plan.load(folder.resolve("plan"))
+                    plan.save(folder.resolve("plan").pathString)
+                    val back = Plan.load(folder.resolve("plan").pathString)
                     back.nodes shouldBe plan.nodes
                     val whole = plan.runCpu(scenarios)
                     back.runCpu(scenarios).asList() shouldBe whole.asList()
@@ -56,14 +58,34 @@ object PlansSuite : Suite() {
             }
         }
 
+        test("A plan and a patch cross as bytes, a part at a time, and come back the same") {
+            engine {
+                val m = ledger()
+                val kept = m.kept()
+                val saved = kept.plan.saved()
+                // Read in parts and written in parts, as they would be to and from a store.
+                val copy = Saved.sized(saved.size)
+                (0 until saved.size step 1000).forEach { from -> copy.write(from, saved.read(from, minOf(1000, saved.size - from).toInt())) }
+                Plan.from(copy).runCpu(m.scenarios).asList() shouldBe kept.plan.runCpu(m.scenarios).asList()
+
+                m.g[m.floors[3]] = 120.0
+                m.g.stabilize()
+                val patch = kept.patch(listOf(m.floors[3])).shouldNotBeNull()
+                val back = Patch.from(patch.saved())
+                listOf(back.width, back.stale) shouldBe listOf(patch.width, patch.stale)
+                refusal { saved.read(saved.size - 1, 2) }
+            }
+        }
+
         test("What cannot be run is refused with the reason") {
             withTempDirectory("watershed-plan") { folder ->
                 engine {
                     val plan = model().plan()
                     refusal { plan.runCpu(DoubleArray(3)) }.why shouldContain "whole number"
                     refusal { plan.setShared(doubleArrayOf(1.0, 2.0)) }
-                    val file = Files.write(folder.resolve("not-a-plan"), "not a plan".toByteArray())
-                    refusal { Plan.load(file) }
+                    val file = folder.resolve("not-a-plan").also { it.writeText("not a plan") }
+                    refusal { Plan.load(file.pathString) }
+                    refusal { Plan.from(Saved.sized(10)) }
                 }
             }
         }
@@ -97,7 +119,7 @@ object PlansSuite : Suite() {
                     listOf(6 to 150.0, 19 to 20.0, 6 to 96.0).forEach { (n, to) ->
                         m.g[m.floors[n]] = to
                         m.g.stabilize()
-                        val file = folder.resolve("patch")
+                        val file = folder.resolve("patch").pathString
                         kept.patch(listOf(m.floors[n])).shouldNotBeNull().save(file)
                         val patch = Patch.load(file)
                         // One group and the total.

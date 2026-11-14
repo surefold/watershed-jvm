@@ -565,7 +565,7 @@ pub unsafe extern "C" fn ws_rows(address: i64) -> i64 {
 
 // ---------------------------------------------------------------------- plans
 
-use crate::plan::{Gpu, Held, Kept, Patch, Plan};
+use crate::plan::{Gpu, Held, Kept, Patch, Plan, Saved};
 
 /// SAFETY: `address` is a live plan: it came from `ws_plan_new` or
 /// `ws_plan_load` and has not been freed.
@@ -950,5 +950,126 @@ pub unsafe extern "C" fn ws_held_refresh(address: i64, with: i64, gpu: i64, allo
         let (held, patch) = unsafe { (&*(address as *const Held), patch(with)) };
         let gpu = (gpu != 0).then(|| (unsafe { &*(gpu as *const Gpu) }, allowed));
         held.refresh(patch, gpu).map(|()| DONE)
+    })
+}
+
+// ------------------------------------------------- plans and patches as bytes
+//
+// A plan or a patch crosses to the JVM as bytes held here, read or written a
+// part at a time, so that a program can keep it wherever it keeps files
+// without either side touching a disk.
+
+/// SAFETY: `address` came from `ws_saved_new`, `ws_plan_saved` or
+/// `ws_patch_saved`, has not been freed, and is used by one thread at a time.
+unsafe fn saved<'a>(address: i64) -> &'a mut Saved {
+    unsafe { &mut *(address as *mut Saved) }
+}
+
+fn extent(from: i64, count: i64) -> Result<(usize, usize)> {
+    match (usize::try_from(from), usize::try_from(count)) {
+        (Ok(from), Ok(count)) => Ok((from, count)),
+        _ => Err(format!(
+            "{count} bytes from {from} is not a part of anything"
+        )),
+    }
+}
+
+/// Room for `size` bytes, all zero, to write a plan or a patch into. Returns
+/// its address, or 0.
+#[unsafe(no_mangle)]
+pub extern "C" fn ws_saved_new(size: i64) -> i64 {
+    attempt(0, || match usize::try_from(size) {
+        Ok(size) => Ok(Box::into_raw(Box::new(Saved::sized(size))) as i64),
+        Err(_) => Err(format!("{size} is not a number of bytes")),
+    })
+}
+
+/// Frees what `ws_saved_new`, `ws_plan_saved` or `ws_patch_saved` gave.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_saved_free(address: i64) {
+    if address != 0 {
+        // SAFETY: it came from one of those and is freed once.
+        drop(unsafe { Box::from_raw(address as *mut Saved) });
+    }
+}
+
+/// How many bytes there are.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_saved_size(address: i64) -> i64 {
+    // SAFETY: see `saved`.
+    attempt(-1, || Ok(unsafe { saved(address) }.0.len() as i64))
+}
+
+/// Copies `count` bytes, starting at `from`, to `out`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_saved_read(address: i64, from: i64, out: *mut u8, count: i64) -> i32 {
+    attempt(REFUSED, || {
+        let (from, count) = extent(from, count)?;
+        // SAFETY: see `saved`; `out` has room for `count`.
+        unsafe {
+            let part = saved(address).part(from, count)?;
+            std::ptr::copy_nonoverlapping(part.as_ptr(), out, count);
+        }
+        Ok(DONE)
+    })
+}
+
+/// Copies `count` bytes from `bytes` to the place `from`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_saved_write(
+    address: i64,
+    from: i64,
+    bytes: *const u8,
+    count: i64,
+) -> i32 {
+    attempt(REFUSED, || {
+        let (from, count) = extent(from, count)?;
+        // SAFETY: see `saved`; `bytes` points to `count` readable bytes.
+        unsafe {
+            let part = saved(address).part_mut(from, count)?;
+            std::ptr::copy_nonoverlapping(bytes, part.as_mut_ptr(), count);
+        }
+        Ok(DONE)
+    })
+}
+
+/// A plan as bytes. Returns their address, or 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_plan_saved(address: i64) -> i64 {
+    // SAFETY: see the top of this file.
+    attempt(0, || {
+        unsafe { plan(address) }
+            .saved()
+            .map(|saved| Box::into_raw(Box::new(saved)) as i64)
+    })
+}
+
+/// A plan from bytes. Returns its address, or 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_plan_of_saved(address: i64) -> i64 {
+    // SAFETY: see `saved`.
+    attempt(0, || {
+        Plan::of_saved(unsafe { saved(address) }).map(|plan| Box::into_raw(Box::new(plan)) as i64)
+    })
+}
+
+/// A patch as bytes. Returns their address, or 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_patch_saved(address: i64) -> i64 {
+    // SAFETY: see the top of this file.
+    attempt(0, || {
+        unsafe { patch(address) }
+            .saved()
+            .map(|saved| Box::into_raw(Box::new(saved)) as i64)
+    })
+}
+
+/// A patch from bytes. Returns its address, or 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ws_patch_of_saved(address: i64) -> i64 {
+    // SAFETY: see `saved`.
+    attempt(0, || {
+        Patch::of_saved(unsafe { saved(address) })
+            .map(|patch| Box::into_raw(Box::new(patch)) as i64)
     })
 }

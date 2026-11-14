@@ -386,21 +386,16 @@ final class Collection private[watershed] (graph: Graph, address: Long):
   def max[T: Number](name: String, of: Part[T])(using fail: Refusing): Node[T] = Node(graph, Native.total(fail, address, name, Wire.LARGEST, of.name))
   def count(name: String)(using fail: Refusing): Node[Long] = Node(graph, Native.total(fail, address, name, Wire.COUNT, null))
 
-  private def write(to: Wire, key: String, fields: Seq[FieldValue])(using fail: Refusing): Unit =
-    to.put(key).put(fields.size)
-    fields.foreach(field => written(answered(to.put(field.name).value(field.value))))
+  private def write(to: Wire, key: String, fields: Seq[FieldValue])(using fail: Refusing): Wire =
+    fields.foldLeft(to.put(key).put(fields.size))((wire, field) => written(answered(wire.put(field.name).value(field.value))))
 
   /** Adds a row, or changes the fields given of one that is there: `orders.upsert("o-1", qty := 2.0)`. */
   def upsert(key: String, fields: FieldValue*)(using fail: Refusing): Unit =
-    val wire = Wire()
-    write(wire, key, fields)
-    Native.upsert(fail, address, wire.bytes(), 1)
+    Native.upsert(fail, address, write(Wire(), key, fields).bytes(), 1)
 
   /** Adds or changes many rows in one call: `orders.upsertAll(Seq(row("o-1", qty := 2.0), ...))`. */
   def upsertAll(rows: Iterable[Row])(using fail: Refusing): Unit =
-    val wire = Wire()
-    rows.foreach(row => write(wire, row.key, row.fields))
-    Native.upsert(fail, address, wire.bytes(), rows.size)
+    Native.upsert(fail, address, rows.foldLeft(Wire())((wire, row) => write(wire, row.key, row.fields)).bytes(), rows.size)
 
   /** Removes a row. Says whether there was one. */
   def remove(key: String)(using fail: Refusing): Boolean = Native.removeRow(fail, address, key)

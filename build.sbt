@@ -1,12 +1,13 @@
-// watershed for the JVM: one build for the native library, the Java core,
+// watershed for the JVM: one build for the native library, the Kotlin core,
 // and the typed layers for Kotlin and Scala 3.
 //
-//     sbt test                    builds everything and runs every test
+//     sbt test                    checks the source against AGENTS.md, builds everything and runs every test
+//     sbt checkHygiene            that check alone
 //     sbt exampleKotlin/run       a small Kotlin program
 //     sbt exampleScala/run        the same in Scala
 //     sbt benchmark               times the engine's benchmark graph from Kotlin
 //
-// It needs Rust (cargo), a JDK (22 or later) and sbt.
+// It needs Rust (cargo), JDK 25 and sbt.
 
 import org.jetbrains.sbt.kotlin.Keys._
 import org.jetbrains.sbt.kotlin.KotlinPlugin
@@ -34,6 +35,16 @@ ThisBuild / buildNative := {
     sys.error("building the native library failed")
 }
 
+// The rules in AGENTS.md that a machine can check, checked before any test runs: see project/Hygiene.scala.
+val checkHygiene = taskKey[Unit]("Refuses source that does by hand what Surefold does, or that is Java.")
+ThisBuild / checkHygiene := {
+  val faults = Hygiene.faults((ThisBuild / baseDirectory).value, Seq("core", "kotlin", "scala", "cluster", "examples"))
+  if (faults.nonEmpty) {
+    faults.foreach(fault => streams.value.log.error(fault))
+    throw new MessageOnlyException(s"${faults.size} lines break the rules in AGENTS.md; a line that must is marked `hygiene: ` with why")
+  }
+}
+
 // Every program and test runs in its own JVM, told where the library is
 // and given leave to call into it.
 val native = Seq(
@@ -44,7 +55,7 @@ val native = Seq(
   ),
   Compile / run := (Compile / run).dependsOn(ThisBuild / buildNative).evaluated,
   Compile / runMain := (Compile / runMain).dependsOn(ThisBuild / buildNative).evaluated,
-  Test / test := (Test / test).dependsOn(ThisBuild / buildNative).value,
+  Test / test := (Test / test).dependsOn(ThisBuild / buildNative, ThisBuild / checkHygiene).value,
 )
 
 // Everything is built for Java 25: the calls use the JDK's foreign function API (JDK 22 and later), and Surefold,
@@ -109,10 +120,18 @@ lazy val cluster = (project in file("cluster"))
     name := "watershed-cluster",
     libraryDependencies ++= Seq(
       "dev.surefold" % "surefold-cluster" % surefold,
+      // A node is a Surefold application: a graph built from configuration, its cluster joined as a section says.
+      "dev.surefold" % "surefold-app" % surefold,
+      "dev.surefold" % "surefold-app-actor" % surefold,
+      "dev.surefold" % "surefold-app-typesafe" % "0.18.0",
+      "dev.surefold" % "surefold-app-cluster" % "0.18.0",
       // A bucket every node reaches. Surefold's platform modules are published at 0.18.0, one behind its core.
       "dev.surefold" % "surefold-files" % "0.18.0",
+      // Surefold's own test fixtures for nodes: a port nothing listens on, for a node a test starts.
+      "dev.surefold" % "surefold-actor-remote" % surefold % Test classifier "test-fixtures",
     ),
-    dependencyOverrides += "dev.surefold" % "surefold" % surefold,
+    dependencyOverrides ++= Seq("surefold", "surefold-actor", "surefold-actor-remote", "surefold-cluster", "surefold-app", "surefold-app-actor")
+      .map("dev.surefold" % _ % surefold),
   )
 
 lazy val exampleKotlin = (project in file("examples/kotlin"))

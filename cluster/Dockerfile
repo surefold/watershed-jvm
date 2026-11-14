@@ -40,5 +40,7 @@ COPY --from=native /src/target/release/libwatershed_jvm.so /opt/watershed/libwat
 COPY cluster/target/image/lib /opt/watershed/lib
 ENV PATH=/opt/java/bin:$PATH
 # The arguments are a node's: `worker name=… port=… seed=…` or `coordinator port=… plan=… …`.
+# What a node logs is UTF-8, whatever the image's locale would have made it.
+ENV LANG=C.UTF-8
 ENTRYPOINT ["java", "-cp", "/opt/watershed/lib/*", "--enable-native-access=ALL-UNNAMED", \
-  "-Dwatershed.library=/opt/watershed/libwatershed_jvm.so", "dev.surefold.watershed.cluster.MainKt"]
+  "-Dwatershed.library=/opt/watershed/libwatershed_jvm.so", "dev.surefold.watershed.cluster.AppKt"]

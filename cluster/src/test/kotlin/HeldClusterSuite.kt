@@ -5,9 +5,6 @@ import dev.surefold.junit.shouldBe
 import dev.surefold.junit.shouldHaveSize
 import dev.surefold.junit.shouldNotBeEmpty
 import dev.surefold.junit.story
-import dev.surefold.fail.Fail
-import dev.surefold.junit.withTempDirectory
-import dev.surefold.watershed.Refused
 import dev.surefold.watershed.Expr
 import dev.surefold.watershed.Graph
 import dev.surefold.watershed.Input
@@ -19,7 +16,6 @@ import dev.surefold.watershed.cluster.Job
 import dev.surefold.watershed.minus
 import dev.surefold.watershed.plus
 import dev.surefold.watershed.times
-import java.nio.file.Path
 import kotlin.time.Duration.Companion.minutes
 
 object HeldClusterSuite : Suite() {
@@ -127,7 +123,7 @@ private class Ledger(private val store: Store) {
     fun jobNow(plan: String): Job = job(kept(), plan)
 
     private fun job(kept: Kept, plan: String): Job {
-        saved("ledger/$plan") { file -> kept.plan.save(file) }
+        store.put("ledger/$plan", engine { kept.plan.saved() }).shouldBeRight()
         store.write("ledger/scenarios", scenarios).shouldBeRight()
         return Job.read(
             store, "book", "ledger/$plan", "ledger/scenarios", 2, 100, "ledger/out",
@@ -135,18 +131,14 @@ private class Ledger(private val store: Store) {
         ).shouldBeRight()
     }
 
-    // Has the engine save something to a file of this machine, and puts that file in the bucket at [key].
-    private fun saved(key: String, save: Fail<Refused>.(Path) -> Unit): String = withTempDirectory("watershed-held") { folder ->
-        engine { save(folder.resolve("saved")) }
-        store.put(folder.resolve("saved"), key).shouldBeRight()
-        key
-    }
+
 
     /** Changes [account]'s floor, and answers where in the bucket the patch is that brings what was kept up to date. */
     fun change(account: Int, floor: Double): String {
         engine { g[floors[account]] = floor }
         val made = kept()
-        return saved("ledger/patch-$account") { file -> made.patch(listOf(floors[account])).shouldNotBeNull().save(file) }
+        val patch = engine { made.patch(listOf(floors[account])).shouldNotBeNull().saved() }
+        return "ledger/patch-$account".also { store.put(it, patch).shouldBeRight() }
     }
 
     /** The total of every scenario, as the cluster's answers have it. */

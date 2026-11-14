@@ -2,7 +2,6 @@ package dev.surefold.watershed
 
 import dev.surefold.fail.Fail
 import dev.surefold.fail.ensure
-import java.nio.file.Path
 
 /**
  * EXPERIMENTAL. A graph's calculation, laid out to run for many scenarios at once: made by [Graph.plan], or read
@@ -46,14 +45,22 @@ class Plan internal constructor(internal val address: Long, private val sizes: L
     context(_: Fail<Refused>)
     fun runCpu(inputs: DoubleArray): DoubleArray = Native.planRunCpu(address, inputs, scenarios(inputs).toLong() * outputs)
 
-    /** Writes the plan to a file, for [load] to read, here or on another machine. */
+    /** Writes the plan to the file at a path, for [load] to read, here or on another machine. */
     context(_: Fail<Refused>)
-    fun save(to: Path) = Native.planSave(address, to.toString())
+    fun save(to: String) = Native.planSave(address, to)
+
+    /** The plan as bytes, for [from] to read back: to keep it somewhere that is not a file of this machine. */
+    context(_: Fail<Refused>)
+    fun saved(): Saved = Saved.of(Native.planSaved(address))
 
     companion object {
-        /** A plan read from a file that [save] wrote. */
+        /** A plan read from the file at a path, which [save] wrote. */
         context(_: Fail<Refused>)
-        fun load(from: Path): Plan = of(Native.planLoad(from.toString()))
+        fun load(from: String): Plan = of(Native.planLoad(from))
+
+        /** A plan from the bytes [saved] gave. */
+        context(_: Fail<Refused>)
+        fun from(saved: Saved): Plan = of(Native.planOfSaved(saved.address))
 
         context(_: Fail<Refused>)
         internal fun of(address: Long): Plan = Plan(address, Native.planSizes(address))
@@ -118,14 +125,22 @@ class Patch internal constructor(internal val address: Long, private val sizes: 
     /** How many nodes it works out for a scenario. */
     val nodes: Long get() = sizes[2]
 
-    /** Writes the patch to a file, for [load] to read, here or on another machine. */
+    /** Writes the patch to the file at a path, for [load] to read, here or on another machine. */
     context(_: Fail<Refused>)
-    fun save(to: Path) = Native.patchSave(address, to.toString())
+    fun save(to: String) = Native.patchSave(address, to)
+
+    /** The patch as bytes, for [from] to read back. */
+    context(_: Fail<Refused>)
+    fun saved(): Saved = Saved.of(Native.patchSaved(address))
 
     companion object {
-        /** A patch read from a file that [save] wrote. */
+        /** A patch read from the file at a path, which [save] wrote. */
         context(_: Fail<Refused>)
-        fun load(from: Path): Patch = of(Native.patchLoad(from.toString()))
+        fun load(from: String): Patch = of(Native.patchLoad(from))
+
+        /** A patch from the bytes [saved] gave. */
+        context(_: Fail<Refused>)
+        fun from(saved: Saved): Patch = of(Native.patchOfSaved(saved.address))
 
         context(_: Fail<Refused>)
         internal fun of(address: Long): Patch = Patch(address, Native.patchSizes(address))
@@ -157,5 +172,33 @@ class Held private constructor(private val address: Long, val scenarios: Int) {
             ensure(vary > 0 && inputs.size % vary == 0) { Refused("${inputs.size} inputs is not a whole number of scenarios of $vary") }
             return Held(Native.held(vary, inputs, values), inputs.size / vary)
         }
+    }
+}
+
+/**
+ * EXPERIMENTAL. A plan or a patch as bytes, held in the engine and read or written a part at a time: a plan can be
+ * bigger than one array. [Plan.saved] and [Patch.saved] give one to read; [Saved.sized] gives one to write into,
+ * for [Plan.from] or [Patch.from] to read back.
+ */
+class Saved private constructor(internal val address: Long, val size: Long) {
+    init {
+        Native.ownSaved(this, address)
+    }
+
+    /** [count] of the bytes, from the one at [from]. */
+    context(_: Fail<Refused>)
+    fun read(from: Long, count: Int): ByteArray = Native.savedRead(address, from, count)
+
+    /** Puts [bytes] at the place [from]. */
+    context(_: Fail<Refused>)
+    fun write(from: Long, bytes: ByteArray) = Native.savedWrite(address, from, bytes, bytes.size)
+
+    companion object {
+        /** Room for [size] bytes, all zero until written. */
+        context(_: Fail<Refused>)
+        fun sized(size: Long): Saved = Saved(Native.saved(size), size)
+
+        context(_: Fail<Refused>)
+        internal fun of(address: Long): Saved = Saved(address, Native.savedSize(address))
     }
 }

@@ -1,5 +1,6 @@
 package dev.surefold.watershed.cluster
 
+import dev.surefold.Schedule
 import dev.surefold.Scope
 import dev.surefold.Shared
 import dev.surefold.actor.ActorRef
@@ -14,25 +15,28 @@ import dev.surefold.cluster.MemberEvent
 import dev.surefold.cluster.sharding
 import dev.surefold.cluster.singleton
 import dev.surefold.fail.Either
+import dev.surefold.fail.Fail
 import dev.surefold.fail.attempt
 import dev.surefold.fail.bind
 import dev.surefold.fail.ensure
+import dev.surefold.fail.fail
+import dev.surefold.fail.flatMap
 import dev.surefold.fail.fold
 import dev.surefold.fail.left
 import dev.surefold.fail.map
 import dev.surefold.fail.mapLeft
 import dev.surefold.fail.right
 import dev.surefold.fail.traverse
+import dev.surefold.retrying
 import dev.surefold.timeoutOrNull
 import dev.surefold.watershed.Gpu
 import dev.surefold.watershed.Refused
-import java.time.Instant
+import kotlin.time.Instant
+import kotlin.time.toKotlinInstant
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.days
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
-import kotlin.time.toJavaDuration
-import kotlin.time.toKotlinDuration
 
 /**
  * A run of many scenarios to be cut into lots: the plan at [plan], the [scenarios] in the file at [inputs], [lot]
@@ -153,7 +157,7 @@ fun Scope<*>.jobs(cluster: Cluster, store: Store, working: Working? = null, pati
         val bench = spawn("bench", bench(Rig(self, store, card, working?.gpuBytes, working?.beforeRun ?: {})))
         // A lot holds what it ran in memory, so it is never put to sleep for being idle.
         val lots = cluster.sharding("watershed-lot", LotCodec, passivateAfter = 3650.days, role = WORKER) { _ -> lot(self, bench) }
-        val workers = Shared(Workers(0, clock.get().now()), "watershed-workers")
+        val workers = Shared(Workers(0, now()), "watershed-workers")
         cluster.subscribe(spawn("workers", counting(cluster, workers)))
         val coordinator = cluster.singleton("watershed-coordinator", CoordinatorCodec, role = COORDINATOR) {
             coordinating({ id -> lots.entity(id) }, { workers.peek().count }, patience)
@@ -168,6 +172,8 @@ private fun card(gpu: Boolean?): Either<NoGpu, Gpu?> = when (gpu) {
     null -> attempt<Refused, Gpu?> { Gpu.open() }.fold({ null }, { it }).right()
 }
 
+private fun now(): Instant = clock.get().now().toKotlinInstant()
+
 // How many workers this node can reach, and since when it has been that many.
 internal data class Workers(val count: Int, val since: Instant)
 
@@ -179,7 +185,7 @@ private fun counting(cluster: Cluster, workers: Shared<Workers>) = behaviour<Mem
         event is MemberEvent.Up || event is MemberEvent.Reachable -> known + member.node
         else -> known - member.node
     }
-    if (next != known) workers.update { Workers(next.size, clock.get().now()) }
+    if (next != known) workers.update { Workers(next.size, now()) }
     become(next)
 }
 
@@ -209,9 +215,9 @@ class Jobs internal constructor(
 
     private tailrec fun settled(count: Int) {
         val seen = workers.awaitUntil { it.count >= count }
-        val wait = java.time.Duration.between(clock.get().now(), seen.since.plus(patience.settled.toJavaDuration()))
-        if (wait.isNegative || wait.isZero) return
-        clock.get().sleep(wait.toKotlinDuration())
+        val wait = seen.since + patience.settled - now()
+        if (!wait.isPositive()) return
+        clock.get().sleep(wait)
         settled(count)
     }
 
@@ -241,17 +247,23 @@ class Jobs internal constructor(
 
     private fun submitted(start: Start): Either<JobFailure, Report> {
         coordinator.tell(start)
-        // The coordinator ends a round itself when its time is up; this waits a little longer, in case it cannot say so.
-        return ended(start, clock.get().now().plus((start.within + 30.seconds).toJavaDuration()))
+        // Asked every so often until it has ended. The coordinator ends a round itself when its time is up; this
+        // gives up a little after that, in case it cannot say so.
+        val asking = Schedule.spaced<Waiting>(patience.askEvery) zipLeft Schedule.upTo(start.within + 30.seconds)
+        return asking.retrying { ended(start) }
+            .mapLeft { JobFailure.NoAnswer("the coordinator did not say how ${start.request} ended") }
+            .flatMap { it }
     }
 
-    private tailrec fun ended(start: Start, until: Instant): Either<JobFailure, Report> {
-        val standing = coordinator.ask<CoordinatorTurn, Standing>(10.seconds) { Progress(start.request, it) }
-        if (standing is Either.Right && standing.value is Standing.Ended) return (standing.value as Standing.Ended).how
-        if (clock.get().now().isAfter(until)) return JobFailure.NoAnswer("the coordinator did not say how ${start.request} ended").left()
+    // How the round ended, or a failure of this ask if it has not yet.
+    context(_: Fail<Waiting>)
+    private fun ended(start: Start): Either<JobFailure, Report> {
+        val standing = coordinator.ask<CoordinatorTurn, Standing>(10.seconds) { Progress(start.request, it) }.fold({ null }, { it })
         // A coordinator that does not know the round has only just taken over from the one that did.
-        if (standing is Either.Right && standing.value == Standing.Unknown) coordinator.tell(start)
-        clock.get().sleep(patience.askEvery)
-        return ended(start, until)
+        if (standing == Standing.Unknown) coordinator.tell(start)
+        return if (standing is Standing.Ended) standing.how else fail(Waiting)
     }
 }
+
+// The round has not ended yet: what an ask fails with, for the schedule to ask again.
+private data object Waiting

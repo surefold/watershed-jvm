@@ -6,7 +6,6 @@ import dev.surefold.fail.ensure
 import dev.surefold.fail.left
 import dev.surefold.fail.map
 import dev.surefold.fail.right
-import java.io.ByteArrayOutputStream
 import java.math.BigDecimal
 import java.math.BigInteger
 
@@ -16,18 +15,21 @@ import java.math.BigInteger
  *
  * Used by the typed Kotlin and Scala layers. Not for calling directly.
  */
-class Wire {
-    private val out = ByteArrayOutputStream(64)
+class Wire private constructor(private val last: Part?, private val size: Int) {
+    constructor() : this(null, 0)
 
-    fun put(value: Byte): Wire = also { out.write(value.toInt()) }
+    // What has been written, last first: each put adds one part and copies nothing.
+    private class Part(val bytes: ByteArray, val before: Part?)
 
-    fun put(value: Int): Wire = also { (0 until 32 step 8).forEach { out.write(value ushr it) } }
+    fun put(value: Byte): Wire = put(byteArrayOf(value))
 
-    fun put(value: Long): Wire = also { (0 until 64 step 8).forEach { out.write((value ushr it).toInt()) } }
+    fun put(value: Int): Wire = put(ByteArray(Int.SIZE_BYTES) { (value ushr (8 * it)).toByte() })
 
-    fun put(more: ByteArray): Wire = also { out.write(more, 0, more.size) }
+    fun put(value: Long): Wire = put(ByteArray(Long.SIZE_BYTES) { (value ushr (8 * it)).toByte() })
 
-    fun put(text: String): Wire = text.toByteArray().let { put(it.size).put(it) }
+    fun put(more: ByteArray): Wire = Wire(Part(more, last), size + more.size)
+
+    fun put(text: String): Wire = text.encodeToByteArray().let { put(it.size).put(it) }
 
     /** A value: a Double, a Long, a BigDecimal, a Boolean or a String. Anything else is refused. */
     fun value(value: Any?): Either<Refused, Wire> = when (value) {
@@ -39,7 +41,14 @@ class Wire {
         else -> Refused("a value is a Double, a Long, a BigDecimal, a Boolean or a String, not $value").left()
     }
 
-    fun bytes(): ByteArray = out.toByteArray()
+    /** Everything written, in the order it was. */
+    fun bytes(): ByteArray = ByteArray(size).also { all -> fill(all, last, size) }
+
+    private tailrec fun fill(all: ByteArray, part: Part?, end: Int) {
+        if (part == null) return
+        part.bytes.copyInto(all, end - part.bytes.size)
+        fill(all, part.before, end - part.bytes.size)
+    }
 
     companion object {
         // The kinds of value, as the engine numbers them.
@@ -100,7 +109,7 @@ class Wire {
 
         @JvmStatic
         fun decimal(low: Long, high: Long, scale: Int): BigDecimal =
-            BigDecimal(BigInteger.valueOf(high).shiftLeft(64).or(BigInteger(java.lang.Long.toUnsignedString(low))), scale)
+            BigDecimal(BigInteger.valueOf(high).shiftLeft(64).or(BigInteger(low.toULong().toString())), scale)
 
         // An expression is the steps a calculator with a stack would take: `qty * price + 1` is qty, price,
         // multiply, 1, add. So an operation is its operands' steps, then one more.

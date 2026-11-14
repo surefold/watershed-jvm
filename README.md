@@ -173,8 +173,9 @@ val plan = g.plan(vary = listOf(rate), outputs = listOf(worth), shared = listOf(
 val answers: DoubleArray = plan.runCpu(doubleArrayOf(0.01, 0.02, 0.03))   // one answer a scenario
 val onGpu = Gpu.open().run(plan, doubleArrayOf(0.01, 0.02, 0.03))               // needs a build with a GPU
 
-plan.save(Path.of("worth.plan"))             // for another process, or another machine
-val back = Plan.load(Path.of("worth.plan"))  // gives the same answers
+plan.save("worth.plan")                      // for another process, or another machine
+val back = Plan.load("worth.plan")           // gives the same answers
+val bytes = plan.saved()                     // or as bytes, read a part at a time, to keep anywhere
 ```
 
 The native library is built without a GPU unless asked: `WATERSHED_CUDA=1 sbt
@@ -205,13 +206,14 @@ cluster already has:
 - **Files are in a bucket**, through `surefold-files`: any S3-compatible
   store (AWS, Cloudflare R2, MinIO and the like). A plan is big (2 GB for a
   graph of 20 million nodes), so it never crosses as a message: a lot is told
-  the plan's key, and its worker fetches it once. Nodes share nothing but the
-  bucket and the cluster, so they need no shared disk.
+  the plan's key, and its worker fetches it once, as bytes, straight into
+  the engine. Nodes share nothing but the bucket and the cluster, and keep
+  nothing on a disk of their own.
 
 ```kotlin
 // On every node, after joining the cluster with the roles it is to have:
 val cluster = cluster(node, Discovery.static("10.0.0.7:25520"), roles = setOf(WORKER), ready = Ready.WhenTold)
-val store = Store(S3Files.of(FilesConfig(bucket = "runs", region = "auto", accessKey = key, secretKey = secret, endpoint = r2)), localFolder)
+val store = Store(S3Files.of(FilesConfig(bucket = "runs", region = "auto", accessKey = key, secretKey = secret, endpoint = r2)))
 val jobs = jobs(cluster, store, working = Working()).bind()     // Either<NoGpu, Jobs>; working = null on a node that runs no lots
 cluster.admit()
 
@@ -231,8 +233,23 @@ hung but not stopped, is given out again under another id, with every lot
 waiting behind it. A lot that fails is tried on other workers, and fails the
 job the third time.
 
-`cluster/run-local.sh` starts a coordinator, workers and an S3 server as
-separate processes on one machine; `cluster/image.sh` builds one container
+A node is a Surefold application: a graph of what it is made of, built from
+configuration and started and released by `runApp`. It joins the cluster as
+its `watershed.cluster` section says, through `surefold-app-cluster`, and is
+admitted once everything in it is built. `cluster/src/main/resources/reference.conf`
+has every setting; each is given in an `application.conf`, as a system
+property, or, for the bucket's keys and a few others, from the environment.
+
+```
+java -Dwatershed.cluster.roles.0=worker -Dwatershed.cluster.static.seeds.0=10.0.0.7:25520 ... AppKt worker
+java -Dwatershed.cluster.roles.0=coordinator -Dwatershed.job.plan=book/plan -Dwatershed.job.lot=1250 ... AppKt submit
+java -Dwatershed.put.from=worth.plan -Dwatershed.put.key=book/plan ... AppKt put
+```
+
+`worker` runs lots until it is stopped; `submit` runs the job in
+`watershed.job`, logs how it went and leaves; `put` copies a file of this
+machine into the bucket. `cluster/run-local.sh` starts them and an S3 server
+as separate processes on one machine; `cluster/image.sh` builds one container
 image for every node, which `cluster/run-containers.sh` runs as containers
 on a Docker network with the S3 server beside them.
 
@@ -247,15 +264,13 @@ because it is told to the lot, by its id.
 
 ```kotlin
 val kept = g.kept(vary = paths, outputs = totals, keep = groupSums)
-kept.plan.save(planFile)
-store.put(planFile, "book/plan").bind()
+store.put("book/plan", kept.plan.saved()).bind()
 val job = Job.read(store, "book", "book/plan", "book/paths", 240, 1_250, "book/out", columns = kept.outputColumns.toList(), hold = true).bind()
 jobs.run(job).bind()
 
 g[promised] = 1.1 * was          // one policy changes
 g.stabilize()
-kept.patch(listOf(promised))?.save(patchFile)
-store.put(patchFile, "book/patch").bind()
+kept.patch(listOf(promised))?.let { store.put("book/patch", it.saved()).bind() }
 val report = jobs.refresh(job, "book/patch").bind()   // report.lost: lots whose worker has gone
 ```
 
@@ -277,8 +292,8 @@ were the same, to the last bit, as one run in one process.
 | One run in one process, no cluster | 11.6 s |
 | Two GPU workers sharing the card, four lots | 24.6 s, 7 s of it each worker fetching and reading the plan |
 | Three GPU workers, one killed part way | 39.8 s, 10 s of it waiting for the cluster to give up on the worker |
-| A held run on two GPU workers | 27.4 s |
-| That run brought up to date after one policy changes | 0.39 s |
+| A held run on two GPU workers | 28.5 s, 10 s of it each worker fetching the plan |
+| That run brought up to date after one policy changes | 0.33 s |
 
 Workers that share one card take turns on it, so more of them is no faster
 here: this shows that the answers are right and what the cluster costs, not
