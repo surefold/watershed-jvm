@@ -133,6 +133,7 @@ lazy val cluster = (project in file("cluster"))
       "org.slf4j" % "slf4j-simple" % "1.7.36",
       // A bucket every node reaches. Surefold's platform modules are published at 0.18.0, one behind its core.
       "dev.surefold" % "surefold-files" % "0.18.0",
+      "com.github.luben" % "zstd-jni" % "1.5.6-9",
       // Surefold's own test fixtures for nodes: a port nothing listens on, for a node a test starts.
       "dev.surefold" % "surefold-actor-remote" % surefold % Test classifier "test-fixtures",
     ),

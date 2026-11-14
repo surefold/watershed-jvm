@@ -5,6 +5,7 @@ import dev.surefold.junit.shouldBe
 import dev.surefold.junit.withTempDirectory
 import dev.surefold.watershed.cluster.Store
 import kotlin.io.path.pathString
+import kotlin.io.path.readBytes
 import kotlin.io.path.writeBytes
 
 object StoreSuite : Suite() {
@@ -37,6 +38,25 @@ object StoreSuite : Suite() {
                 // A file there whole is not in pieces.
                 store.upload(file.pathString, "book/whole").shouldBeRight()
                 store.pieced("book/whole").shouldBeRight() shouldBe false
+            }
+        }
+
+        testEach("A packed file is fetched, and copied to this machine, as it was", listOf(1_000, 6_000_000), named = { "$it bytes" }) { size ->
+            withTempDirectory("watershed-store") { folder ->
+                val store = Store(InMemoryFiles())
+                // Bytes that repeat, as a plan's do, with something in them that does not.
+                val bytes = ByteArray(size) { ((it % 97) xor (it / 4096)).toByte() }
+                val file = folder.resolve("plan").also { it.writeBytes(bytes) }
+                store.uploadPacked(file.pathString, "book/plan").shouldBeRight()
+                store.upload(file.pathString, "book/plain").shouldBeRight()
+                listOf("book/plan", "book/plain").forEach { key ->
+                    val saved = store.fetch(key).shouldBeRight()
+                    saved.size shouldBe size.toLong()
+                    engine { saved.read(0, size) }.asList() shouldBe bytes.asList()
+                    val copy = folder.resolve("copies").resolve(key)
+                    store.download(key, copy.pathString).shouldBeRight()
+                    copy.readBytes().asList() shouldBe bytes.asList()
+                }
             }
         }
     }

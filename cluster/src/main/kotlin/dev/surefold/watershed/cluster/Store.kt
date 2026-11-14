@@ -12,11 +12,21 @@ import dev.surefold.files.FileKey
 import dev.surefold.files.FileMeta
 import dev.surefold.files.FilePage
 import dev.surefold.files.Files
+import com.github.luben.zstd.ZstdInputStream
+import com.github.luben.zstd.ZstdOutputStream
+import dev.surefold.watershed.Plan
 import dev.surefold.watershed.Refused
 import dev.surefold.watershed.Saved
 import kotlin.io.path.Path
+import kotlin.io.path.createParentDirectories
+import kotlin.io.path.createTempFile
+import kotlin.io.path.deleteIfExists
+import kotlin.io.path.exists
 import kotlin.io.path.fileSize
 import kotlin.io.path.inputStream
+import kotlin.io.path.moveTo
+import kotlin.io.path.outputStream
+import kotlin.io.path.pathString
 
 /**
  * Where a job's files are: a bucket every node reaches, through Surefold's [Files] (any S3-compatible store, or
@@ -26,7 +36,11 @@ import kotlin.io.path.inputStream
  * Numbers in a file are eight bytes each, least significant first, one after another: what the engine's own
  * examples write.
  */
-class Store(private val files: Files) {
+class Store(
+    private val files: Files,
+    /** A folder of this machine to look in for a plan before the bucket: the `get` command puts one there, for every worker of the machine to read. */
+    private val local: String? = null,
+) {
     /** How many numbers the file at [key] holds, whether it is there whole or in pieces. */
     fun count(key: String): Either<JobFailure.File, Long> = attempt {
         val pieces = pieces(key).bind()
@@ -86,14 +100,69 @@ class Store(private val files: Files) {
     /** The plan or patch at [key], as bytes in the engine, for `Plan.from` or `Patch.from` to read. */
     fun fetch(key: String): Either<JobFailure.File, Saved> = attempt {
         val size = bucket(key) { files.head(it).bind().size }.bind()
-        val saved = engine(key) { Saved.sized(size) }
         val content = bucket(key) { files.get(it).bind() }.bind()
-        content.use { filled(key, saved, it.stream::readNBytes, 0) }
-        saved
+        content.use {
+            val start = disk(key) { it.stream.readNBytes(HEAD) }.bind()
+            val packed = unpacked(start)
+            if (packed == null) {
+                // As it is: what was read to find that out is its beginning.
+                val saved = engine(key) { Saved.sized(size) }
+                ensure(start.size <= size) { JobFailure.File(key, "it is longer than the store said: $size bytes") }
+                engine(key) { saved.write(0, start) }
+                filled(key, saved, it.stream::readNBytes, start.size.toLong())
+                saved
+            } else {
+                val saved = engine(key) { Saved.sized(packed) }
+                val plain = disk(key) { ZstdInputStream(it.stream) }.bind()
+                filled(key, saved, plain::readNBytes, 0)
+                saved
+            }
+        }
+    }
+
+    /** The plan at [key]: from this machine's folder if it is there, and from the bucket if not. */
+    fun plan(key: String): Either<JobFailure.File, Plan> = attempt {
+        val here = local?.let { Path(it, key) }?.takeIf { disk(key) { it.exists() }.bind() }
+        if (here == null) fetch(key).bind().let { saved -> engine(key) { Plan.from(saved) } } else engine(key) { Plan.load(here.pathString) }
+    }
+
+    /** Copies the file at [key] to the path [to] on this machine, as it was before it was packed. */
+    fun download(key: String, to: String): Either<JobFailure.File, Unit> = attempt {
+        val content = bucket(key) { files.get(it).bind() }.bind()
+        // Under another name until it is whole, so that nothing reads half of it.
+        val part = Path("$to.part")
+        disk(key) {
+            part.createParentDirectories()
+            content.use {
+                val start = it.stream.readNBytes(HEAD)
+                part.outputStream().use { out ->
+                    if (unpacked(start) == null) out.write(start).also { _ -> it.stream.copyTo(out) } else ZstdInputStream(it.stream).copyTo(out)
+                }
+            }
+            part.moveTo(Path(to), overwrite = true)
+        }.bind()
     }
 
     /** Puts the file at the path [from], on this machine, into the bucket at [key]: how what the engine's examples wrote gets there. */
     fun upload(from: String, key: String): Either<JobFailure.File, Unit> = upload(from, key, 0)
+
+    /**
+     * As [upload], with the file packed (zstd) on the way: a plan is a quarter of its size so, and [fetch], [plan]
+     * and [download] give it back as it was. Not for a file read by anything else.
+     */
+    fun uploadPacked(from: String, key: String): Either<JobFailure.File, Unit> = attempt {
+        val size = disk(key) { Path(from).fileSize() }.bind()
+        val packed = disk(key) { createTempFile("watershed-packed") }.bind()
+        disk(key) {
+            packed.outputStream().use { out ->
+                out.write(MARK + size.bytes())
+                ZstdOutputStream(out, LEVEL).also { it.setWorkers(WORKERS) }.use { zstd -> Path(from).inputStream().use { it.copyTo(zstd) } }
+            }
+        }.bind()
+        val sent = upload(packed.pathString, key)
+        disk(key) { packed.deleteIfExists() }.bind()
+        sent.bind()
+    }
 
     /**
      * As [upload], in pieces of [piece] bytes if that is more than none, each a file of its own: for the numbers
@@ -162,6 +231,22 @@ class Store(private val files: Files) {
 
     private companion object {
         const val BYTES = "application/octet-stream"
+
+        // What a packed file begins with: this, then how many bytes it is unpacked, then those bytes as zstd.
+        val MARK = "WSPACKED".encodeToByteArray()
+        val HEAD = MARK.size + Long.SIZE_BYTES
+        const val LEVEL = 3
+        const val WORKERS = 8
+
+        // How many bytes the file that begins with [start] is once unpacked, if it is packed.
+        fun unpacked(start: ByteArray): Long? =
+            if (start.size == HEAD && start.copyOf(MARK.size).contentEquals(MARK)) {
+                (0 until Long.SIZE_BYTES).fold(0L) { all, byte -> all or ((start[MARK.size + byte].toLong() and 0xff) shl (8 * byte)) }
+            } else {
+                null
+            }
+
+        fun Long.bytes(): ByteArray = ByteArray(Long.SIZE_BYTES) { byte -> (this ushr (8 * byte)).toByte() }
 
         // Pieces are numbered with this many digits, so that their keys are in order as the store lists them.
         const val PIECE_DIGITS = 6

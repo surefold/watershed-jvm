@@ -133,7 +133,7 @@ private fun <A> Either<JobFailure.File, A>.filed(): A = mapLeft { "${it.key}: ${
 context(_: Fail<String>)
 private fun run(rig: Rig, bench: Bench, lot: Run): Pair<Bench, Took> {
     val started = now()
-    val plan = bench.plans[lot.plan] ?: rig.store.fetch(lot.plan).filed().let { saved -> engine { Plan.from(saved) } }
+    val plan = bench.plans[lot.plan] ?: rig.store.plan(lot.plan).filed()
     val from = lot.first * plan.inputs
     val until = from + lot.count.toLong() * plan.inputs
     // Scenarios put in the bucket in pieces are fetched a lot at a time; a whole file is fetched once and kept.

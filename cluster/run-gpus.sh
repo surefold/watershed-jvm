@@ -9,7 +9,9 @@
 # PREFIX is where the job's files are in the bucket: PREFIX/plan, PREFIX/paths (best put there in pieces, with
 # put.piece-mb, so that a worker fetches only what its lot needs) and, to compare the answers with,
 # PREFIX/whole. The answers go to PREFIX/out. Set PLAN to use a plan that is somewhere else in the bucket, for
-# scenarios that share one. The bucket comes from the environment, and its keys from nowhere else:
+# scenarios that share one. The plan is fetched from the bucket once, into a folder every worker reads it from;
+# set LOCAL=0 to have each worker fetch its own. The bucket comes from the environment, and its keys from
+# nowhere else. CPU=1 runs the workers on the CPU, to try the script where Docker cannot reach a GPU:
 #
 #     WATERSHED_BUCKET, WATERSHED_S3_ENDPOINT, WATERSHED_S3_ACCESS_KEY, WATERSHED_S3_SECRET_KEY
 #
@@ -39,16 +41,28 @@ node() {
     -e JAVA_TOOL_OPTIONS="${given[*]}" "$image" "$1"
 }
 
+plan="${PLAN:-$prefix/plan}"
+shared=()
+if [ "${LOCAL:-1}" != 0 ]; then
+  # Once for the machine: unpacked if it was packed, and read by every worker in place of a fetch each.
+  cache="$(mktemp -d)"
+  started=$(date +%s.%N)
+  node "fetch" --rm -v "$cache:/cache" -- get.key="$plan" get.to="/cache/$plan" get >/dev/null 2>&1
+  echo "the plan fetched once for the machine in $(echo "$(date +%s.%N) - $started" | bc | cut -c1-5) s"
+  shared=(-v "$cache:/cache:ro")
+  settings+=(-Dwatershed.bucket.local=/cache)
+fi
 cores=$(nproc)
 for n in $(seq 0 $((gpus - 1))); do
   names+=("$net-gpu-$n")
   # Each worker has one GPU to itself, and its share of the cores for reading the plan.
-  node "gpu-$n" -d --name "$net-gpu-$n" --gpus "device=$n" -e RAYON_NUM_THREADS=$(( (cores - 2) / gpus > 0 ? (cores - 2) / gpus : 1 )) -- \
-    cluster.roles.0=worker worker.gpu=true worker >/dev/null
+  on=(--gpus "device=$n"); [ "${CPU:-0}" = 1 ] && on=()
+  node "gpu-$n" -d --name "$net-gpu-$n" "${on[@]}" "${shared[@]}" -e RAYON_NUM_THREADS=$(( (cores - 2) / gpus > 0 ? (cores - 2) / gpus : 1 )) -- \
+    cluster.roles.0=worker worker.gpu=$([ "${CPU:-0}" = 1 ] && echo false || echo true) worker >/dev/null
 done
 names+=("$net-coordinator")
 status=0
-node coordinator --name "$net-coordinator" -- cluster.roles.0=coordinator job.plan="${PLAN:-$prefix/plan}" \
+node coordinator --name "$net-coordinator" -- cluster.roles.0=coordinator job.plan="$plan" \
   job.inputs="$prefix/paths" job.inputs-per="$inputs_per" job.outputs-per="$outputs_per" job.lot="$lot" \
   job.out="$prefix/out" job.workers="$gpus" job.check="$prefix/whole" submit || status=$?
 # What each worker said, kept for after the containers are gone.
