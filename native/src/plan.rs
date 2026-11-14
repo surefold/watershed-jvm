@@ -62,6 +62,18 @@ impl Plan {
             .or_else(|e| refused(format!("{path}: {e}")))
     }
 
+    /// The plan as the bytes `save` writes, held here for the JVM to read.
+    pub(crate) fn saved(&self) -> Result<Saved> {
+        let mut bytes = Vec::new();
+        self.lock().save(&mut bytes).or_else(refused)?;
+        Ok(Saved(bytes))
+    }
+
+    /// A plan from the bytes `saved` gave, wherever they have been since.
+    pub(crate) fn of_saved(saved: &Saved) -> Result<Plan> {
+        Scenarios::load(&saved.0[..]).map(Plan::of).or_else(refused)
+    }
+
     /// How many varied inputs, shared inputs, outputs, and nodes worked
     /// out for each scenario.
     pub(crate) fn sizes(&self) -> [i64; 4] {
@@ -252,6 +264,20 @@ impl Patch {
             .or_else(|e| refused(format!("{path}: {e}")))
     }
 
+    /// The patch as the bytes `save` writes, held here for the JVM to read.
+    pub(crate) fn saved(&self) -> Result<Saved> {
+        let mut bytes = Vec::new();
+        self.inner.save(&mut bytes).or_else(refused)?;
+        Ok(Saved(bytes))
+    }
+
+    /// A patch from the bytes `saved` gave.
+    pub(crate) fn of_saved(saved: &Saved) -> Result<Patch> {
+        EnginePatch::load(&saved.0[..])
+            .map(|inner| Patch { inner })
+            .or_else(refused)
+    }
+
     /// How many values are kept for a scenario, how many of them the patch
     /// works out again, and on how many nodes.
     pub(crate) fn sizes(&self) -> [i64; 3] {
@@ -342,5 +368,42 @@ impl Held {
         };
         patch.apply(&mut held.1, &results);
         Ok(())
+    }
+}
+
+/// A plan or a patch as bytes, held in the engine while they cross to or
+/// from the JVM a part at a time: a plan can be bigger than one JVM array.
+pub(crate) struct Saved(pub(crate) Vec<u8>);
+
+impl Saved {
+    /// Room for `size` bytes, to be written a part at a time.
+    pub(crate) fn sized(size: usize) -> Saved {
+        Saved(vec![0; size])
+    }
+
+    /// The `count` bytes from `from`, if they are all there.
+    pub(crate) fn part(&self, from: usize, count: usize) -> Result<&[u8]> {
+        match from.checked_add(count).and_then(|to| self.0.get(from..to)) {
+            Some(part) => Ok(part),
+            None => refused(format!(
+                "bytes {from} to {} are not all within the {} there are",
+                from.saturating_add(count),
+                self.0.len()
+            )),
+        }
+    }
+
+    pub(crate) fn part_mut(&mut self, from: usize, count: usize) -> Result<&mut [u8]> {
+        let size = self.0.len();
+        match from
+            .checked_add(count)
+            .and_then(|to| self.0.get_mut(from..to))
+        {
+            Some(part) => Ok(part),
+            None => refused(format!(
+                "bytes {from} to {} are not all within the {size} there are",
+                from.saturating_add(count)
+            )),
+        }
     }
 }

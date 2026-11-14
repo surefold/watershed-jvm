@@ -19,7 +19,6 @@ import dev.surefold.resourceScope
 import dev.surefold.scope
 import dev.surefold.files.Files
 import dev.surefold.files.InMemoryFiles
-import dev.surefold.junit.withTempDirectory
 import dev.surefold.watershed.cluster.COORDINATOR
 import dev.surefold.watershed.cluster.Jobs
 import dev.surefold.watershed.cluster.Patience
@@ -28,8 +27,7 @@ import dev.surefold.watershed.cluster.Working
 import dev.surefold.watershed.cluster.jobs
 import dev.surefold.watershed.cluster.WORKER
 import dev.surefold.watershed.Refused
-import java.net.ServerSocket
-import java.nio.file.Path
+import kotlin.random.Random
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
@@ -39,48 +37,46 @@ import kotlin.time.Duration.Companion.seconds
 internal fun <A> engine(block: Fail<Refused>.() -> A): A = attempt(block).shouldBeRight()
 
 /** Runs [test] with nodes it can start, in a scope of its own, and stops them all after it. */
-internal fun cluster(lotWithin: Duration = 5.minutes, test: (Nodes) -> Unit) = withTempDirectory("watershed-cluster") { folder ->
-    scope {
-        resourceScope {
-            val nodes = Nodes(this@scope, InMemoryFiles(), folder, lotWithin)
-            onRelease { nodes.stopAll() }
-            test(nodes)
-        }
+internal fun cluster(lotWithin: Duration = 5.minutes, test: (Nodes) -> Unit) = scope {
+    resourceScope {
+        val nodes = Nodes(this@scope, InMemoryFiles(), lotWithin)
+        onRelease { nodes.stopAll() }
+        test(nodes)
     }
 }
+
+// A node is given its port when it is made. Each takes the next of a run of ports that starts somewhere of this
+// run's own, so that tests running together, and two runs of the tests, do not ask for the same one.
+private val ports = Shared(20_000 + Random.nextInt(400) * 100, "test.ports")
+
+private fun nextPort(): Int = ports.modify { it + 1 to it }
 
 /**
  * Several nodes of one cluster in this JVM. Each is a fork of the test's scope with a scope of its own inside, so
  * that one can be stopped, and leave the cluster, while the others go on.
  */
-internal class Nodes(private val test: Scope<Nothing>, private val files: Files, private val folder: Path, lotWithin: Duration) {
+internal class Nodes(private val test: Scope<Nothing>, files: Files, lotWithin: Duration) {
     // Quick to tell a lot again and to ask how a round stands, so that a test is not spent waiting.
     private val patience = Patience(lotWithin = lotWithin, tellAgainEvery = 300.milliseconds, askEvery = 50.milliseconds, settled = 600.milliseconds)
 
-    /** The test's own way into the bucket the nodes share, for putting a job's files there. */
-    val store: Store = store("test")
+    /** The bucket the nodes share, and the test's own way into it, for putting a job's files there. */
+    val store: Store = Store(files)
 
-    // Every node shares the bucket, and has a folder of its own for the copies it fetches.
-    private fun store(name: String) = Store(files, folder.resolve(name))
-
-    // A node is given its port when it is made, so a free one is found first; Surefold has no way to ask for one.
-    private fun freePort(): Int = ServerSocket(0).use { it.localPort }
-
-    private val seed = freePort()
+    private val seed = nextPort()
     private val stops = Shared<Map<String, () -> Unit>>(emptyMap(), "test.nodes")
 
     /** The node the others join, which runs the coordinator and no lots; a job is submitted through what it answers. */
     fun coordinator(): Jobs =
-        start("coordinator", setOf(COORDINATOR), seed) { cluster -> jobs(cluster, store("coordinator"), patience = patience).shouldBeRight() }
+        start("coordinator", setOf(COORDINATOR), seed) { cluster -> jobs(cluster, store, patience = patience).shouldBeRight() }
 
     /** Another node that may run the coordinator, and does once the first has gone. */
     fun standby(): Jobs =
-        start("standby", setOf(COORDINATOR), freePort()) { cluster -> jobs(cluster, store("standby"), patience = patience).shouldBeRight() }
+        start("standby", setOf(COORDINATOR), nextPort()) { cluster -> jobs(cluster, store, patience = patience).shouldBeRight() }
 
     /** A worker on the CPU, which calls [beforeRun] before each lot it runs. */
     fun worker(name: String, beforeRun: (Int) -> Unit = {}): Jobs =
-        start(name, setOf(WORKER), freePort()) { cluster ->
-            jobs(cluster, store(name), Working(gpu = false, beforeRun = beforeRun), patience).shouldBeRight()
+        start(name, setOf(WORKER), nextPort()) { cluster ->
+            jobs(cluster, store, Working(gpu = false, beforeRun = beforeRun), patience).shouldBeRight()
         }
 
     /** Workers with these names, once [jobs] counts every worker there is. */

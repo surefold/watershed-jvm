@@ -15,10 +15,10 @@ import dev.surefold.fail.Either
 import dev.surefold.fail.left
 import dev.surefold.fail.right
 import dev.surefold.logInfo
-import java.time.Instant
+import kotlin.time.Instant
+import kotlin.time.toKotlinInstant
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.nanoseconds
-import kotlin.time.toKotlinDuration
 
 // The coordinator is one actor in the whole cluster, a singleton, on the oldest node that may run it. It tells
 // each lot of a job what to do and hears how it went. Which worker a lot is on is the cluster's business: a lot is
@@ -158,7 +158,7 @@ private class Dealer(private val lots: (String) -> ActorRef<LotTurn>, private va
                 val out = wanted.associateWith { lot ->
                     if (told.patch != null) Out(holding?.get(lot) ?: id(job, lot, 0), placed = true) else Out(id(job, lot, 0))
                 }
-                val round = Round(told, clock.get().now(), wanted.size, out)
+                val round = Round(told, clock.get().now().toKotlinInstant(), wanted.size, out)
                 ctx.timers.every("again", patience.tellAgainEvery, TellAgain(told.request))
                 ctx.timers.after("round", told.within, OutOfTime(told.request))
                 out.forEach { (lot, to) -> tell(ctx, round, lot, to) }
@@ -284,7 +284,7 @@ private class Dealer(private val lots: (String) -> ActorRef<LotTurn>, private va
             if (round.out.isNotEmpty()) {
                 table.copy(round = round)
             } else {
-                val took = java.time.Duration.between(round.started, clock.get().now()).toKotlinDuration()
+                val took = clock.get().now().toKotlinInstant() - round.started
                 val report = Report(round.done.values.sortedBy { it.lot }, round.givenAgain, round.failures, took, round.lost.sorted())
                 val before = table.holders[round.job.id].orEmpty()
                 val holding = when {

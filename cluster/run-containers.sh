@@ -20,7 +20,7 @@ key="watershed" secret="local-$RANDOM-$RANDOM-$RANDOM"
 docker run -d --name "$net-s3" --hostname s3 --network "$net" \
   -e RUSTFS_ACCESS_KEY="$key" -e RUSTFS_SECRET_KEY="$secret" rustfs/rustfs:1.0.1 >/dev/null
 node=(--network "$net" -e WATERSHED_S3_ACCESS_KEY="$key" -e WATERSHED_S3_SECRET_KEY="$secret")
-bucket=(bucket=watershed region=us-east-1 endpoint=http://s3:9000 path-style=true local=/tmp/watershed-files)
+bucket=(bucket=watershed region=us-east-1 endpoint=http://s3:9000 path-style=true)
 
 # The job's files go into the bucket; nothing else of this machine reaches a node. A folder the engine's `rerun`
 # example wrote has a patch as well: the lots then hold what they ran, and are brought up to date with it.

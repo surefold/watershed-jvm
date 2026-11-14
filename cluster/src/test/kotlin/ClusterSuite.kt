@@ -6,7 +6,6 @@ import dev.surefold.junit.shouldBe
 import dev.surefold.junit.shouldBeGreaterThanOrEqual
 import dev.surefold.junit.shouldHaveSize
 import dev.surefold.junit.story
-import dev.surefold.junit.withTempDirectory
 import dev.surefold.watershed.Expr
 import dev.surefold.watershed.Graph
 import dev.surefold.watershed.Node
@@ -16,7 +15,6 @@ import dev.surefold.watershed.cluster.Store
 import dev.surefold.watershed.minus
 import dev.surefold.watershed.plus
 import dev.surefold.watershed.times
-import java.nio.file.Path
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 
@@ -145,12 +143,11 @@ object ClusterSuite : Suite() {
 internal class Book(val job: Job, val whole: List<Double>)
 
 /** Puts the book's plan and scenarios in the bucket [store] is on, and answers the job over them. */
-internal fun book(store: Store): Book = withTempDirectory("watershed-book") { folder: Path ->
-    engine { Accounts.plan.save(folder.resolve("plan")) }
-    store.put(folder.resolve("plan"), "book/plan").shouldBeRight()
+internal fun book(store: Store): Book {
+    store.put("book/plan", engine { Accounts.plan.saved() }).shouldBeRight()
     store.write("book/scenarios", Accounts.scenarios).shouldBeRight()
     val job = Job.read(store, "job", "book/plan", "book/scenarios", Accounts.plan.inputs, 100, "book/out").shouldBeRight()
-    Book(job, engine { Accounts.plan.runCpu(Accounts.scenarios) }.asList())
+    return Book(job, engine { Accounts.plan.runCpu(Accounts.scenarios) }.asList())
 }
 
 // Eight accounts that grow at a rate and take a shock each period, and their total: built once for the suite.

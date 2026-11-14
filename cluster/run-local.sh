@@ -43,12 +43,12 @@ if [ -f "$folder/patch" ]; then
 fi
 make=true
 for file in "${files[@]}"; do
-  "${run[@]}" put from="$folder/$file" key="book/$file" make-bucket=$make "${bucket[@]}" local="$logs/files-put" >>"$logs/put.log" 2>&1
+  "${run[@]}" put from="$folder/$file" key="book/$file" make-bucket=$make "${bucket[@]}" >>"$logs/put.log" 2>&1
   make=false
 done
 "${run[@]}" coordinator port=$port plan=book/plan inputs=book/paths inputs-per=$inputs_per \
   outputs-per=$outputs_per lot="$lot" out=book/out workers=$((gpus + cpus)) check=book/whole \
-  "${bucket[@]}" local="$logs/files-coordinator" "${more[@]}" 2> >(tee "$logs/coordinator.log" >&2) &
+  "${bucket[@]}" "${more[@]}" 2> >(tee "$logs/coordinator.log" >&2) &
 coordinator=$!
 cores=$(nproc)
 # The GPU workers share the card: four fifths of what is free now, split between them.
@@ -58,14 +58,14 @@ if [ "$gpus" -gt 0 ]; then
 fi
 for n in $(seq 1 "$gpus"); do
   "${run[@]}" worker name="gpu-$n" port=$((port + n)) seed="127.0.0.1:$port" gpu=true gpu-bytes=$bytes \
-    "${bucket[@]}" local="$logs/files-gpu-$n" >"$logs/gpu-$n.log" 2>&1 &
+    "${bucket[@]}" >"$logs/gpu-$n.log" 2>&1 &
   pids+=($!)
 done
 for n in $(seq 1 "$cpus"); do
   # Left two cores short, so that a busy worker still answers the cluster.
   RAYON_NUM_THREADS=$(( (cores - 2) / (cpus > 0 ? cpus : 1) )) \
     "${run[@]}" worker name="cpu-$n" port=$((port + 100 + n)) seed="127.0.0.1:$port" gpu=false \
-    "${bucket[@]}" local="$logs/files-cpu-$n" >"$logs/cpu-$n.log" 2>&1 &
+    "${bucket[@]}" >"$logs/cpu-$n.log" 2>&1 &
   pids+=($!)
 done
 # Set KILL_AFTER to a number of seconds to kill the first worker outright that long after starting, as a crash.

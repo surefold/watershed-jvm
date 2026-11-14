@@ -27,7 +27,6 @@ import dev.surefold.logInfo
 import dev.surefold.logger
 import dev.surefold.scope
 import java.net.URI
-import java.nio.file.Path
 import kotlin.system.exitProcess
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.minutes
@@ -43,12 +42,12 @@ private const val USAGE = """EXPERIMENTAL. One node of a cluster that runs a pla
 
 and, for every one of them, where the files are:
 
-               bucket=NAME [region=auto] [endpoint=https://...] [path-style=true] [local=FOLDER]
+               bucket=NAME [region=auto] [endpoint=https://...] [path-style=true]
 
 A job's files are in an S3-compatible bucket that every node reaches: its plan, its scenarios, each lot's answers.
 A KEY names a file there. `put` copies a file of this machine into the bucket, which is how a plan or a patch the
 engine saved gets there. The bucket's access key and secret are read from the environment, WATERSHED_S3_ACCESS_KEY
-and WATERSHED_S3_SECRET_KEY, not from the command line. local= is a folder for the copies a node fetches.
+and WATERSHED_S3_SECRET_KEY, not from the command line. A node keeps nothing on its own disk.
 
 columns= names the plan's outputs to write as answers. With hold=true each lot holds on to what it ran, and patch=
 then brings them up to date with a patch from the engine's Kept. check= and check-after= name files of the answers
@@ -65,7 +64,7 @@ private data class Stopped(val why: String, val code: Int)
 private sealed interface Command {
     val store: Store
 
-    data class Put(override val store: Store, val from: Path, val key: String, val bucket: S3Files?) : Command
+    data class Put(override val store: Store, val from: String, val key: String, val bucket: S3Files?) : Command
 
     data class Work(
         override val store: Store,
@@ -132,7 +131,7 @@ private fun bucket(set: Settings, environment: Map<String, String>): Pair<S3File
         endpoint = set.read("endpoint", "an address") { text -> Either.catch { URI(text) }.fold({ null }, { it }) },
         pathStyle = set.flag("path-style") ?: false,
     )
-    return S3Files.of(config).let { it to Store(it, Path.of(set["local"] ?: "watershed-files")) }
+    return S3Files.of(config).let { it to Store(it) }
 }
 
 context(_: Fail<Stopped>)
@@ -142,7 +141,7 @@ private fun command(args: Array<String>, environment: Map<String, String>): Comm
     val host = set["host"] ?: "127.0.0.1"
     return when (args[0]) {
         "put" -> bucket(set, environment).let { (bucket, store) ->
-            Command.Put(store, Path.of(set.need("from")), set.need("key"), bucket.takeIf { set.flag("make-bucket") == true })
+            Command.Put(store, set.need("from"), set.need("key"), bucket.takeIf { set.flag("make-bucket") == true })
         }
         "worker" -> Command.Work(
             store(set, environment), host, set.needInt("port"), set.need("name"), set.need("seed"),
@@ -235,11 +234,11 @@ private fun <A> Either<JobFailure, A>.orStop(): A = mapLeft { Stopped(it.toStrin
 // Stops unless the job's answers are, to the last bit, the numbers in the file at [check].
 context(_: Fail<Stopped>)
 private fun same(store: Store, job: Job, outputsPer: Int, check: String) {
-    // Lot by lot, so that a big job's answers are never all in memory twice.
-    val same = store.count(check).orStop() == job.scenarios * outputsPer && (0 until job.lots).all { lot ->
+    val theirs = store.read(check).orStop()
+    val same = theirs.size.toLong() == job.scenarios * outputsPer && (0 until job.lots).all { lot ->
         val ours = store.read(job.answers(lot)).orStop()
-        val theirs = store.read(check, job.first(lot) * outputsPer, job.count(lot).toLong() * outputsPer).orStop()
-        ours.size == theirs.size && ours.indices.all { ours[it].toRawBits() == theirs[it].toRawBits() }
+        val from = (job.first(lot) * outputsPer).toInt()
+        ours.size == job.count(lot) * outputsPer && ours.indices.all { ours[it].toRawBits() == theirs[from + it].toRawBits() }
     }
     ensure(same) { Stopped("THE ANSWERS DIFFER from $check", 1) }
     logInfo("the answers are the same to the last bit as $check")
@@ -259,7 +258,7 @@ private fun node(args: Array<String>): Int {
         when (val command = command(args, System.getenv())) {
             is Command.Put -> {
                 command.bucket?.createBucket()?.mapLeft { Stopped("the bucket could not be made: $it", 1) }?.bind()
-                command.store.put(command.from, command.key).orStop()
+                command.store.upload(command.from, command.key).orStop()
                 logInfo("${command.from} is at ${command.key}")
             }
             is Command.Work -> scope { work(command) }
