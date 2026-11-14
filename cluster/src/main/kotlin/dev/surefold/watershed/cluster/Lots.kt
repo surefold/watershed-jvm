@@ -133,12 +133,17 @@ private fun <A> Either<JobFailure.File, A>.filed(): A = mapLeft { "${it.key}: ${
 context(_: Fail<String>)
 private fun run(rig: Rig, bench: Bench, lot: Run): Pair<Bench, Took> {
     val started = now()
-    val plan = bench.plans[lot.plan] ?: rig.store.fetch(lot.plan).filed().let { saved -> engine { Plan.from(saved) } }
-    val all = bench.inputs[lot.inputs] ?: rig.store.read(lot.inputs).filed()
+    val plan = bench.plans[lot.plan] ?: rig.store.plan(lot.plan).filed()
     val from = lot.first * plan.inputs
     val until = from + lot.count.toLong() * plan.inputs
-    ensure(from >= 0 && until <= all.size) { "${lot.inputs}: it has no scenario ${lot.first + lot.count - 1}" }
-    val inputs = all.copyOfRange(from.toInt(), until.toInt())
+    // Scenarios put in the bucket in pieces are fetched a lot at a time; a whole file is fetched once and kept.
+    val all = if (rig.store.pieced(lot.inputs).filed()) null else bench.inputs[lot.inputs] ?: rig.store.read(lot.inputs).filed()
+    val inputs = if (all == null) {
+        rig.store.read(lot.inputs, from, (until - from).toInt()).filed()
+    } else {
+        ensure(from >= 0 && until <= all.size) { "${lot.inputs}: it has no scenario ${lot.first + lot.count - 1}" }
+        all.copyOfRange(from.toInt(), until.toInt())
+    }
     val loaded = now()
     rig.beforeRun(lot.lot)
     val running = now()
@@ -158,7 +163,7 @@ private fun run(rig: Rig, bench: Bench, lot: Run): Pair<Bench, Took> {
         else -> DoubleArray(lot.count * columns.size) { answers[it / columns.size * plan.outputs + columns[it % columns.size]] }
     }
     rig.store.write(lot.answers, chosen).filed()
-    return bench.copy(plans = bench.plans + (lot.plan to plan), inputs = bench.inputs + (lot.inputs to all)) to
+    return bench.copy(plans = bench.plans + (lot.plan to plan), inputs = if (all == null) bench.inputs else bench.inputs + (lot.inputs to all)) to
         Took(loaded - started, ran - running, held)
 }
 

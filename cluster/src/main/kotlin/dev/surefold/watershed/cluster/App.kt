@@ -45,6 +45,7 @@ private class Bucket(
     val accessKey: Secret,
     val secretKey: Secret,
     val create: Boolean,
+    val local: String,
 )
 
 private class Card(val gpu: String, val gpuBytes: Long)
@@ -67,14 +68,16 @@ class Asked internal constructor(
     val checkAfter: String,
 )
 
-class Putting internal constructor(val from: String, val key: String)
+class Putting internal constructor(val from: String, val key: String, val pieceMb: Int, val pack: Boolean)
+
+class Getting internal constructor(val key: String, val to: String)
 
 // The bucket, and the store on it.
 private val bucket: Module =
     config<Bucket>("watershed.bucket") {
         Bucket(
             string("name"), string("region"), string("endpoint"), boolean("path-style"),
-            secret("access-key"), secret("secret-key"), boolean("create"),
+            secret("access-key"), secret("secret-key"), boolean("create"), string("local"),
         )
     } +
         // The client is the graph's to close, once nothing built on it is left.
@@ -89,7 +92,7 @@ private val bucket: Module =
                 if (settings.create) files.createBucket().fold({ refuse("the bucket could not be made: $it") }, {})
             }
         } +
-        single { files: S3Files -> Store(files) }
+        single { files: S3Files, settings: Bucket -> Store(files, settings.local.takeIf { it.isNotEmpty() }) }
 
 // A node of the cluster: it joins as its configuration says, and is admitted once everything here is built, so no
 // lot is sent to it before it can take one. Its roles say whether it runs lots.
@@ -188,13 +191,34 @@ object Put : SurefoldApp<Upload>() {
 
     override val module: Module =
         loadedConfig() + bucket +
-            config<Putting>("watershed.put") { Putting(string("from"), string("key")) } +
+            config<Putting>("watershed.put") { Putting(string("from"), string("key"), int("piece-mb"), boolean("pack")) } +
             single { store: Store, putting: Putting -> Upload(store, putting) }
 
     override fun AppScope.run(root: Upload) {
-        root.store.upload(root.putting.from, root.putting.key).fold(
+        val put = root.putting
+        val done = if (put.pack) root.store.uploadPacked(put.from, put.key) else root.store.upload(put.from, put.key, put.pieceMb * 1024L * 1024L)
+        done.fold(
             { why -> logError("${why.key}: ${why.why}").also { failed.update { true } } },
             { logInfo("${root.putting.from} is at ${root.putting.key}") },
+        )
+    }
+}
+
+class Download internal constructor(val store: Store, val getting: Getting)
+
+/** Copies the file at `watershed.get.key` in the bucket to `watershed.get.to` on this machine, and leaves. */
+object Get : SurefoldApp<Download>() {
+    internal val failed = Shared(false, "watershed-get")
+
+    override val module: Module =
+        loadedConfig() + bucket +
+            config<Getting>("watershed.get") { Getting(string("key"), string("to")) } +
+            single { store: Store, getting: Getting -> Download(store, getting) }
+
+    override fun AppScope.run(root: Download) {
+        root.store.download(root.getting.key, root.getting.to).fold(
+            { why -> logError("${why.key}: ${why.why}").also { failed.update { true } } },
+            { logInfo("${root.getting.key} is at ${root.getting.to}") },
         )
     }
 }
@@ -204,7 +228,8 @@ fun main(args: Array<String>) {
         "worker" -> runApp(Worker).code
         "submit" -> runApp(Submit).code.takeIf { it != 0 } ?: if (Submit.failed.peek()) 1 else 0
         "put" -> runApp(Put).code.takeIf { it != 0 } ?: if (Put.failed.peek()) 1 else 0
-        else -> 2.also { logError("say worker, submit or put; every setting is in reference.conf, and is given as -Dwatershed.SETTING=VALUE") }
+        "get" -> runApp(Get).code.takeIf { it != 0 } ?: if (Get.failed.peek()) 1 else 0
+        else -> 2.also { logError("say worker, submit, put or get; every setting is in reference.conf, and is given as -Dwatershed.SETTING=VALUE") }
     }
     exitProcess(code)
 }
