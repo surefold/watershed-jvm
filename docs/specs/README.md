@@ -6,3 +6,4 @@ after that.
 
 - [cluster-resilience.md](cluster-resilience.md): a job that survives the loss of any one node, on several machines.
 - [readme-fused-figures.md](readme-fused-figures.md): the README's figures for a clustered plan's lots.
+- [worst-year-in-200.md](worst-year-in-200.md): the capital calculation done directly, on the whole book, with error bars and against the shortcuts.
