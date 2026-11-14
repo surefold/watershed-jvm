@@ -49,4 +49,4 @@ names+=("$net-coordinator")
 docker run --name "$net-coordinator" --hostname coordinator "${node[@]}" "$image" \
   coordinator host=coordinator port=25520 plan=book/plan inputs=book/paths inputs-per="$inputs_per" \
   outputs-per="$outputs_per" lot="$lot" out=book/out workers="$workers" check=book/whole \
-  "${bucket[@]}" "${more[@]}" 2>/dev/null
+  "${bucket[@]}" "${more[@]}"

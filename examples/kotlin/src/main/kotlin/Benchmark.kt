@@ -1,6 +1,8 @@
 import dev.surefold.fail.Fail
 import dev.surefold.fail.attempt
 import dev.surefold.fail.fold
+import dev.surefold.logError
+import dev.surefold.logInfo
 import dev.surefold.watershed.*
 import java.math.BigDecimal
 import kotlin.random.Random
@@ -52,7 +54,7 @@ private fun show(d: Duration): String {
 
 fun main(args: Array<String>) {
     val trades = args.firstOrNull()?.replace("_", "")?.toIntOrNull() ?: 500_000
-    exitProcess(attempt<Refused, Unit> { benchmark(trades) }.fold({ println("refused: ${it.why}").let { 1 } }, { 0 }))
+    exitProcess(attempt<Refused, Unit> { benchmark(trades) }.fold({ logError("refused: ${it.why}").let { 1 } }, { 0 }))
 }
 
 context(_: Fail<Refused>)
@@ -74,8 +76,7 @@ private fun benchmark(trades: Int) {
     }
     val (prices, total) = built
     val nodes = g.size()
-    println("graph: $nodes nodes built from Kotlin in ${show(build)} (${"%.1f".format(build.inWholeNanoseconds / 1000.0 / nodes)} µs a node)")
-    println()
+    logInfo("graph: $nodes nodes built from Kotlin in ${show(build)} (${"%.1f".format(build.inWholeNanoseconds / 1000.0 / nodes)} µs a node)")
 
     // Warm the JVM up on the calls being timed.
     repeat(2_000) {
@@ -97,11 +98,10 @@ private fun benchmark(trades: Int) {
     val quiet = Graph()
     val lone = quiet.input("lone", 1.0)
 
-    println("%-46s %12s".format("median of many runs, from Kotlin", "time"))
-    println("%-46s %12s".format("incremental: one price changes", show(one)))
-    println("%-46s %12s".format("incremental: 1% of prices change together", show(some)))
-    println("%-46s %12s".format("incremental: 10% of prices change together", show(many)))
-    println()
+    logInfo("%-46s %12s".format("median of many runs, from Kotlin", "time"))
+    logInfo("%-46s %12s".format("incremental: one price changes", show(one)))
+    logInfo("%-46s %12s".format("incremental: 1% of prices change together", show(some)))
+    logInfo("%-46s %12s".format("incremental: 10% of prices change together", show(many)))
 
     // What each kind of value costs to set and to read, and what a node
     // or a row costs to add, one at a time and many at once.
@@ -115,17 +115,16 @@ private fun benchmark(trades: Int) {
         repeat(50_000) { step(it) }
         return median(50_000) { step(50_000 + it) }
     }
-    println("%-46s %12s".format("one call, from Kotlin", "time"))
-    println("%-46s %12s".format("set a Double", show(each { n -> quiet[lone] = n.toDouble() })))
-    println("%-46s %12s".format("read a Double", show(each { _ -> quiet[lone] })))
-    println("%-46s %12s".format("an update with nothing to do", show(each { _ -> quiet.stabilize() })))
-    println("%-46s %12s".format("set a Long", show(each { n -> quiet[whole] = n.toLong() })))
-    println("%-46s %12s".format("read a Long", show(each { _ -> quiet[whole] })))
-    println("%-46s %12s".format("set a BigDecimal", show(each { n -> quiet[decimal] = cents[n % 1000] })))
-    println("%-46s %12s".format("read a BigDecimal", show(each { _ -> quiet[decimal] })))
-    println("%-46s %12s".format("set a String", show(each { n -> quiet[text] = words[n % 1000] })))
-    println("%-46s %12s".format("read a String", show(each { _ -> quiet[text] })))
-    println()
+    logInfo("%-46s %12s".format("one call, from Kotlin", "time"))
+    logInfo("%-46s %12s".format("set a Double", show(each { n -> quiet[lone] = n.toDouble() })))
+    logInfo("%-46s %12s".format("read a Double", show(each { _ -> quiet[lone] })))
+    logInfo("%-46s %12s".format("an update with nothing to do", show(each { _ -> quiet.stabilize() })))
+    logInfo("%-46s %12s".format("set a Long", show(each { n -> quiet[whole] = n.toLong() })))
+    logInfo("%-46s %12s".format("read a Long", show(each { _ -> quiet[whole] })))
+    logInfo("%-46s %12s".format("set a BigDecimal", show(each { n -> quiet[decimal] = cents[n % 1000] })))
+    logInfo("%-46s %12s".format("read a BigDecimal", show(each { _ -> quiet[decimal] })))
+    logInfo("%-46s %12s".format("set a String", show(each { n -> quiet[text] = words[n % 1000] })))
+    logInfo("%-46s %12s".format("read a String", show(each { _ -> quiet[text] })))
 
     val count = 200_000
     fun perItem(total: Duration) = "%.2f µs each".format(total.inWholeNanoseconds / 1000.0 / count)
@@ -137,8 +136,8 @@ private fun benchmark(trades: Int) {
     val together = measureTime {
         (0 until count).chunked(BATCH).forEach { batch -> b.defineAll(batch.map { "n$it" to base2 * it.toDouble() + 1.0 }) }
     }
-    println("%-46s %14s".format("$count nodes, one define each", perItem(oneByOne)))
-    println("%-46s %14s".format("$count nodes, defineAll in batches", perItem(together)))
+    logInfo("%-46s %14s".format("$count nodes, one define each", perItem(oneByOne)))
+    logInfo("%-46s %14s".format("$count nodes, defineAll in batches", perItem(together)))
 
     fun table(g: Graph): Triple<dev.surefold.watershed.Collection, Field<Double>, Field<BigDecimal>> {
         val orders = g.collection("orders")
@@ -157,13 +156,12 @@ private fun benchmark(trades: Int) {
             rowsAll.upsertAll(batch.map { row("o$it", qtyAll(it), priceAll(cents[it % 1000])) })
         }
     }
-    println("%-46s %14s".format("$count rows, one upsert each", perItem(rowByRow)))
-    println("%-46s %14s".format("$count rows, upsertAll in batches", perItem(rowsTogether)))
+    logInfo("%-46s %14s".format("$count rows, one upsert each", perItem(rowByRow)))
+    logInfo("%-46s %14s".format("$count rows, upsertAll in batches", perItem(rowsTogether)))
     c.stabilize()
     d.stabilize()
     c.checkConsistency()
     d.checkConsistency()
-    println()
     g.checkConsistency()
-    println("checked: incremental result matches a full recalculation (total = ${"%.2f".format(g[total])})")
+    logInfo("checked: incremental result matches a full recalculation (total = ${"%.2f".format(g[total])})")
 }

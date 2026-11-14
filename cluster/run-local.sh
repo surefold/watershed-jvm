@@ -48,7 +48,7 @@ for file in "${files[@]}"; do
 done
 "${run[@]}" coordinator port=$port plan=book/plan inputs=book/paths inputs-per=$inputs_per \
   outputs-per=$outputs_per lot="$lot" out=book/out workers=$((gpus + cpus)) check=book/whole \
-  "${bucket[@]}" local="$logs/files-coordinator" "${more[@]}" 2>"$logs/coordinator.log" &
+  "${bucket[@]}" local="$logs/files-coordinator" "${more[@]}" 2> >(tee "$logs/coordinator.log" >&2) &
 coordinator=$!
 cores=$(nproc)
 # The GPU workers share the card: four fifths of what is free now, split between them.

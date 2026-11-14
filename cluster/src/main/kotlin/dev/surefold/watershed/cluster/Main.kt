@@ -1,7 +1,10 @@
 package dev.surefold.watershed.cluster
 
+import dev.surefold.LogLevel
+import dev.surefold.Logger
 import dev.surefold.Promise
 import dev.surefold.Scope
+import dev.surefold.StderrLogger
 import dev.surefold.actor.remote.node
 import dev.surefold.awaitValue
 import dev.surefold.cluster.Discovery
@@ -19,6 +22,9 @@ import dev.surefold.fail.fold
 import dev.surefold.fail.mapLeft
 import dev.surefold.files.FilesConfig
 import dev.surefold.files.S3Files
+import dev.surefold.logError
+import dev.surefold.logInfo
+import dev.surefold.logger
 import dev.surefold.scope
 import java.net.URI
 import java.nio.file.Path
@@ -184,7 +190,7 @@ private fun Scope<Stopped>.work(command: Command.Work) {
     )
     jobs(cluster, command.store, command.working).mapLeft { Stopped("no GPU: ${it.why}", 1) }.bind()
     cluster.admit()
-    println("worker ${node.self} is up")
+    logInfo("worker ${node.self} is up")
     // A latch nobody opens: the worker goes on until its process is stopped.
     Promise<Nothing, Unit>("watershed-worker").awaitValue()
 }
@@ -202,23 +208,22 @@ private fun Scope<Stopped>.coordinate(command: Command.Coordinate) {
     )
     val jobs = jobs(cluster, command.store, patience = Patience(lotWithin = command.lotWithin)).mapLeft { Stopped(it.why, 1) }.bind()
     cluster.admit()
-    println("coordinator ${node.self}: ${job.scenarios} scenarios in ${job.lots} lots of ${job.lot}; waiting for ${command.workers} workers")
+    logInfo("coordinator ${node.self}: ${job.scenarios} scenarios in ${job.lots} lots of ${job.lot}; waiting for ${command.workers} workers")
     ensure(jobs.awaitWorkers(command.workers, command.wait)) { Stopped("only ${jobs.workers()} of ${command.workers} workers joined", 1) }
 
     val report = jobs.run(job, within = 600.minutes).orStop()
-    println("%5s  %-34s %4s %10s %10s".format("lot", "worker", "on", "loaded in", "ran in"))
-    report.lots.forEach { println("%5d  %-34s %4s %9.1fs %9.1fs".format(it.lot, it.worker, it.on, it.loadSeconds, it.runSeconds)) }
-    report.failures.forEach { println("failed and given to another: $it") }
-    println("all ${job.lots} lots answered in ${report.took}; ${report.givenAgain} given out again")
+    logInfo("%5s  %-34s %4s %10s %10s".format("lot", "worker", "on", "loaded in", "ran in"))
+    report.lots.forEach { logInfo("%5d  %-34s %4s %9.1fs %9.1fs".format(it.lot, it.worker, it.on, it.loadSeconds, it.runSeconds)) }
+    report.failures.forEach { logInfo("failed and given to another: $it") }
+    logInfo("all ${job.lots} lots answered in ${report.took}; ${report.givenAgain} given out again")
     command.check?.let { same(command.store, job, command.outputsPer, it) }
 
     command.patch?.let { patch ->
         val refreshed = jobs.refresh(job, patch).orStop()
-        println()
-        println("brought up to date with $patch:")
-        refreshed.lots.forEach { println("%5d  %-34s %4s %9.3fs %9.3fs".format(it.lot, it.worker, it.on, it.loadSeconds, it.runSeconds)) }
-        refreshed.failures.forEach { println("failed: $it") }
-        println("${refreshed.lots.size} lots brought up to date in ${refreshed.took}; lost: ${refreshed.lost}")
+        logInfo("brought up to date with $patch:")
+        refreshed.lots.forEach { logInfo("%5d  %-34s %4s %9.3fs %9.3fs".format(it.lot, it.worker, it.on, it.loadSeconds, it.runSeconds)) }
+        refreshed.failures.forEach { logInfo("failed: $it") }
+        logInfo("${refreshed.lots.size} lots brought up to date in ${refreshed.took}; lost: ${refreshed.lost}")
         ensure(refreshed.lost.isEmpty()) { Stopped("lots ${refreshed.lost} were lost", 1) }
         command.checkAfter?.let { same(command.store, job, command.outputsPer, it) }
     }
@@ -237,20 +242,29 @@ private fun same(store: Store, job: Job, outputsPer: Int, check: String) {
         ours.size == theirs.size && ours.indices.all { ours[it].toRawBits() == theirs[it].toRawBits() }
     }
     ensure(same) { Stopped("THE ANSWERS DIFFER from $check", 1) }
-    println("the answers are the same to the last bit as $check")
+    logInfo("the answers are the same to the last bit as $check")
 }
 
+// What a node says goes to the log, as everything of Surefold's does; its debug lines, a dead letter for every
+// message to a node that has just left, are left out.
+private val quietly = Logger { line -> if (line.level != LogLevel.Debug) StderrLogger.log(line) }
+
 fun main(args: Array<String>) {
+    logger.locally(quietly) { exitProcess(node(args)) }
+}
+
+// Does what the command line asks, and answers the exit code.
+private fun node(args: Array<String>): Int {
     val ended = attempt<Stopped, Unit> {
         when (val command = command(args, System.getenv())) {
             is Command.Put -> {
                 command.bucket?.createBucket()?.mapLeft { Stopped("the bucket could not be made: $it", 1) }?.bind()
                 command.store.put(command.from, command.key).orStop()
-                println("${command.from} is at ${command.key}")
+                logInfo("${command.from} is at ${command.key}")
             }
             is Command.Work -> scope { work(command) }
             is Command.Coordinate -> scope { coordinate(command) }
         }
     }
-    exitProcess(ended.fold({ stopped -> println(stopped.why).let { stopped.code } }, { 0 }))
+    return ended.fold({ stopped -> logError(stopped.why).let { stopped.code } }, { 0 })
 }
