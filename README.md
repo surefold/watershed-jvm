@@ -36,8 +36,8 @@ sbt exampleScala/run      # the same in Scala
 sbt benchmark             # times the engine's benchmark graph from Kotlin
 ```
 
-It needs Rust (`cargo`), JDK 25 and sbt. The engine's repository
-is private, so `git` on the machine must be able to fetch it.
+It needs Rust (`cargo`), JDK 25 and sbt. The engine is fetched from
+[its repository](https://github.com/surefold/watershed) as it builds.
 
 ## Typed, with nothing written as text
 
